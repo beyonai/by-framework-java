@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.iwhaleai.byai</groupId>
+        <artifactId>by-framework-history</artifactId>
+        <version>0.2.7</version>
+    </parent>
+
+    <artifactId>by-framework-history-byclaw</artifactId>
+    <packaging>jar</packaging>
+
+    <name>by-framework-history-byclaw</name>
+    <description>ByClaw remote history backend for by-framework</description>
+
+    <dependencies>
+        <!-- Core framework -->
+        <dependency>
+            <groupId>com.iwhaleai.byai</groupId>
+            <artifactId>by-framework</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- HTTP Client for ByClaw history -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
