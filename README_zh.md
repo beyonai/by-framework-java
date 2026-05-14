@@ -1,15 +1,51 @@
-# 🚀 by-framework-java
+# By-Framework for Java
 
-[English](README.md) | [中文](README_zh.md)
+<div align="center">
 
 [![Version](https://img.shields.io/badge/version-0.2.7-blue.svg)](pom.xml)
 [![Java CI with Maven](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml/badge.svg)](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml)
 [![Java](https://img.shields.io/badge/java-21+-orange.svg)](pom.xml)
 [![Redis](https://img.shields.io/badge/redis-7.0+-red.svg)](pom.xml)
+</div>
+
+<div align="center">
+
+[English](README.md) | [中文](README_zh.md)
+
+**重要链接:** [文档](https://beyonai.github.io/by-framework-docs) · [Python 版本](https://beyonai.github.io/by-framework-python) · [TypeScript 版本](https://beyonai.github.io/by-framework-ts)
+
+</div>
 
 ## 📖 概述
 
-**by-framework-java** 是一个基于 Redis Streams 构建的分布式、高性能 Agent 调度引擎的 Java 实现。它为【超级助手】、【数字员工】等具备自驱编排、沙箱隔离能力的智能体服务提供了标准化的开发框架和运行环境。
+**By-Framework** 是一个基于 Redis Streams 构建标的分布式高性能 Agent 调度引擎，专为多 Agent 系统设计。
+
+## 传统架构的困境
+
+传统 AI 应用架构在面对 Agent 场景时常面临三大挑战：
+
+- **全链路同步阻塞 $\rightarrow$ 迫使用户“人肉盯看”** — 前端与后端强绑定，页面关闭即任务中断。用户无法跨端切换，工作流极易因网络波动或意外打断而前功尽弃。
+- **无法支撑超长任务 $\rightarrow$ 导致系统“全程陪同”** — 面对数分钟甚至小时级的推理，调用方必须持续阻塞线程等待，不仅面临网关超时截断，更造成了严重的计算资源空转与浪费。
+- **多 Agent 编排的中断恢复困局** — 在复杂级联调用中，一旦出现超时或中断，系统难以精准定位状态并恢复，开发者往往需自建极其复杂的持久化状态机。
+
+## By-Framework 的方案
+
+![Architecture Overview](./assets/img/architecture_zh.png)
+
+By-Framework 通过**控制与数据平面分离**的异步架构解决上述问题：
+
+- **指令异步化**：APP 通过 **Gateway Client** 将用户请求转化为控制指令并投入 **Control Queue**。由于是异步解耦，APP 无需阻塞等待，后端线程（完美配合 Java 21 虚拟线程）立即释放。
+- **Agent 集群消费**：分布式的 **Agents** 集群竞争消费控制队列中的消息。通过逻辑寻址（Agent Type）自动实现负载均衡，天然支持动态扩缩容。
+- **过程数据回传**：Agent 在执行过程中，将流式文本（Chunk）、状态变更（State）及产物（Artifact）异步推送到 **Data Queue**。APP 通过 **Gateway Client** 实时监听以获取任务进度，从而原生支持超长任务。
+- **原生编排与中断恢复**：当 Agent 需要调用其他 Agent（编排）时，它会将新指令发往 **Control Queue**。这种基于消息的机制允许 Agent 在等待期间释放资源，并在收到回复后精准恢复上下文。
+
+## 亮点
+
+- 🚀 **异步与事件驱动** — 控制与数据分离于独立 Redis Stream，Worker 扩缩容与数据投递路径解耦
+- 🧩 **现代 Java 支持** — 基于 Java 21 构建，完美支持虚拟线程，满足高并发 Agent 任务需求
+- 🔌 **插件系统** — 支持热加载插件机制，提供生命周期钩子、工具、提示词和子 Agent 配置
+- 🤝 **多 Agent 编排** — 内置 call_agent、scatter-gather 扇出和人机交互模式
+- 🛡️ **生产就绪** — 竞争消费、优雅退出、消息持久化与执行状态追踪
 
 ---
 
@@ -68,7 +104,7 @@
 ```xml
 <dependency>
     <groupId>com.iwhaleai.byai</groupId>
-    <artifactId>gateway-sdk-java</artifactId>
+    <artifactId>by-framework</artifactId>
     <version>0.2.7</version>
 </dependency>
 ```

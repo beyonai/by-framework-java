@@ -1,15 +1,52 @@
-# 🚀 by-framework-java
+# By-Framework for Java
 
-[English](README.md) | [中文](README_zh.md)
+
+<div align="center">
 
 [![Version](https://img.shields.io/badge/version-0.2.7-blue.svg)](pom.xml)
 [![Java CI with Maven](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml/badge.svg)](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml)
 [![Java](https://img.shields.io/badge/java-21+-orange.svg)](pom.xml)
 [![Redis](https://img.shields.io/badge/redis-7.0+-red.svg)](pom.xml)
+</div>
+
+<div align="center">
+
+[English](README.md) | [中文](README_zh.md)
+
+**Important Links:** [Documentation](https://beyonai.github.io/by-framework-docs) · [Python Version](https://beyonai.github.io/by-framework-python) · [TypeScript Version](https://beyonai.github.io/by-framework-ts)
+
+</div>
 
 ## 📖 Overview
 
-**by-framework-java** is a Java implementation of a distributed, high-performance Agent scheduling engine built on Redis Streams. It provides a standardized development framework and runtime environment for agent services such as "Super Assistants" and "Digital Employees" with self-driven orchestration and sandbox isolation capabilities.
+**By-Framework** is a distributed, high-performance Agent scheduling engine built on Redis Streams, purpose-built for multi-agent systems.
+
+## Challenges in Traditional Architecture
+
+Traditional AI application architectures often face three critical challenges when dealing with Agent scenarios:
+
+- **Full-link Synchronous Blocking $\rightarrow$ Forced "Manual Monitoring"** — Strong coupling between frontend and backend means tasks are interrupted if the page is closed. Users cannot switch devices or tasks, making workflows fragile to network fluctuations or interruptions.
+- **Inability to Support Long-running Tasks $\rightarrow$ System "Constant Accompaniment"** — For reasoning tasks taking minutes or hours, callers must block threads and wait. This leads to gateway timeouts and massive waste of idle compute resources.
+- **Inter-Agent Orchestration Recovery Dilemma** — In complex cascaded calls, if a timeout or interruption occurs, it's nearly impossible to accurately resume state. Developers are forced to build extremely complex persistent state machines.
+
+## The By-Framework Solution
+
+![Architecture Overview](./assets/img/architecture_en.png)
+
+By-Framework addresses these issues through an asynchronous architecture with **separated Control and Data Planes**:
+
+- **Instruction Asynchrony**: The APP sends control instructions to the **Control Queue** via the **Gateway Client**. Being asynchronous, the APP never blocks, and backend threads (perfectly utilizing Java 21 virtual threads) are released immediately.
+- **Agent Cluster Consumption**: A distributed cluster of **Agents** competitively consumes messages from the control queue. Logical routing (Agent Type) provides native load balancing and elastic scaling.
+- **Data Stream Feedback**: During execution, Agents asynchronously push chunks, state changes, and artifacts to the **Data Queue**. The APP listens via the **Gateway Client** for progress, natively supporting ultra-long tasks.
+- **Native Orchestration & Resumption**: When an Agent needs to call another Agent, it sends a new instruction to the **Control Queue**. This message-based mechanism allows tasks to release resources while waiting and resume context precisely upon receiving a reply.
+
+## Highlights
+
+- 🚀 **Async & Event-Driven** — Control and data on separate Redis Streams; scale Workers without touching the delivery path
+- 🧩 **Modern Java Support** — Built on Java 21 with full support for virtual threads for high-concurrency agent tasks
+- 🔌 **Plugin System** — Hot-reloadable plugins with lifecycle hooks, tools, prompts, and sub-agent configs
+- 🤝 **Inter-Agent Orchestration** — Built-in `call_agent`, scatter-gather fan-out, and user-in-the-loop patterns
+- 🛡️ **Production-Ready** — Competitive consumption, graceful shutdown, message persistence, and execution state tracking
 
 ---
 
@@ -23,15 +60,6 @@
 - [📡 Sending Tasks](#-sending-tasks)
 - [🧪 Examples](#-examples)
 - [🛠️ Configuration](#️-configuration)
-
----
-
-## ✨ Features
-
-- ⚡ **Modern Java Support**: Built on Java 21 with full support for virtual threads to meet high-concurrency agent task requirements.
-- 🧩 **Highly Extensible**: Built-in extension system, supporting dynamic registration of custom commands, tools, and prompts.
-- 📊 **State Management**: Robust `AgentContext` support for easy streaming output, state transitions, and artifact handling.
-- 🔄 **Decoupled Architecture**: Features a "Control Flow - Data Flow Separation" design, supporting horizontal scaling of multi-language Worker clusters.
 
 ---
 
@@ -70,7 +98,7 @@ Add the following dependency to your `pom.xml`:
 ```xml
 <dependency>
     <groupId>com.iwhaleai.byai</groupId>
-    <artifactId>gateway-sdk-java</artifactId>
+    <artifactId>by-framework</artifactId>
     <version>0.2.7</version>
 </dependency>
 ```
