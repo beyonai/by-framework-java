@@ -3,7 +3,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.2.7-blue.svg)](pom.xml)
+[![Version](https://img.shields.io/badge/version-0.2.8-blue.svg)](pom.xml)
 [![Java CI with Maven](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml/badge.svg)](https://github.com/beyonai/by-framework-java/actions/workflows/ci.yml)
 [![Java](https://img.shields.io/badge/java-21+-orange.svg)](pom.xml)
 [![Redis](https://img.shields.io/badge/redis-7.0+-red.svg)](pom.xml)
@@ -99,7 +99,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
     <groupId>com.iwhaleai.byai</groupId>
     <artifactId>by-framework</artifactId>
-    <version>0.2.7</version>
+    <version>0.2.8</version>
 </dependency>
 ```
 
