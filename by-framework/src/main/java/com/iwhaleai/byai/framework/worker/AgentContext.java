@@ -4,6 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityResult;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityRouter;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityStatus;
+import com.iwhaleai.byai.framework.core.availability.DeliveryIntent;
+import com.iwhaleai.byai.framework.core.availability.RoutePolicy;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.AskAgentCommand;
 import com.iwhaleai.byai.framework.core.protocol.DataMessage;
@@ -30,6 +35,7 @@ public class AgentContext {
     private final String currentAgentType;
     private final String currentMessageId;
     private final WorkerRegistry workerRegistry;
+    private final AvailabilityRouter availabilityRouter;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // SSE Content Types
@@ -47,6 +53,7 @@ public class AgentContext {
         this.currentAgentType = currentAgentType;
         this.currentMessageId = currentMessageId;
         this.workerRegistry = new WorkerRegistry(redisClient);
+        this.availabilityRouter = new AvailabilityRouter(redisClient, workerRegistry);
     }
 
     public boolean isStreamFinished() {
@@ -255,40 +262,88 @@ public class AgentContext {
 
     public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
             Map<String, Object> metadata) {
-        return callAgent(targetAgentType, content, payload, waitForReply, metadata, null);
+        return callAgent(targetAgentType, content, payload, waitForReply, metadata, null, RoutePolicy.FAIL_FAST, 0, null, null);
     }
 
     public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
             Map<String, Object> metadata, String taskGroupId) {
-        return callAgent(targetAgentType, content, payload, waitForReply, metadata, taskGroupId, true);
+        return callAgent(targetAgentType, content, payload, waitForReply, metadata, taskGroupId, RoutePolicy.FAIL_FAST, 0, null, null);
     }
 
+    /**
+     * Call another agent with full availability control.
+     *
+     * @param targetAgentType      Target agent type
+     * @param content              Message content
+     * @param payload              Optional payload
+     * @param waitForReply         Whether to wait for reply
+     * @param metadata             Optional metadata
+     * @param taskGroupId          Optional task group ID
+     * @param routePolicy          Route policy for availability control
+     * @param availabilityTimeoutMs Timeout for WAKE_AND_WAIT policy
+     * @param region               Optional region
+     * @param priority             Optional priority
+     * @return Response map with status, message_id, etc.
+     */
     public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
-                Map<String, Object> metadata, String taskGroupId, boolean requireOnlineWorker) {
-
-        if (requireOnlineWorker) {
-            WorkerRegistry.OnlineAgentCheckResult result = workerRegistry.hasOnlineAgentType(targetAgentType, true, Constants.SD_DEFAULT_HEALTH_THRESHOLD_MS);
-            if (!result.exists) {
-                log.warn("[{}] No online worker found for agent type '{}'", traceId, targetAgentType);
-                Map<String, Object> errorResponse = new HashMap<>();
-                errorResponse.put(Constants.RedisFields.STATUS, AgentState.FAILED);
-                errorResponse.put("message_id", "");
-                errorResponse.put("target_agent_type", targetAgentType);
-                errorResponse.put("error", "No online worker found for agent type '" + targetAgentType + "'");
-                errorResponse.put("error_code", "AGENT_TYPE_UNAVAILABLE");
-                return errorResponse;
-            }
-        }
+            Map<String, Object> metadata, String taskGroupId, String routePolicy, long availabilityTimeoutMs,
+            String region, String priority) {
 
         String msgId = Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
         String executionId = Constants.EXECUTION_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+        String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
+
+        // Build delivery intent and check availability via router
+        DeliveryIntent intent = DeliveryIntent.builder()
+                .executionId(executionId)
+                .messageId(msgId)
+                .sessionId(sessionId)
+                .traceId(traceId)
+                .source(waitForReply ? currentAgentType : "")
+                .targetAgentType(targetAgentType)
+                .userCode("")
+                .region(region)
+                .priority(priority)
+                .policy(resolvedPolicy)
+                .timeoutMs(availabilityTimeoutMs)
+                .metadata(metadata != null ? metadata : new HashMap<>())
+                .build();
+
+        AvailabilityResult availResult = availabilityRouter.prepareDelivery(intent);
+
+        // Handle REJECT
+        if (AvailabilityStatus.REJECT.equals(availResult.getStatus())) {
+            log.warn("[{}] Availability rejected for agent type '{}': {}", traceId, targetAgentType, availResult.getReason());
+            Map<String, Object> errorResponse = new HashMap<>();
+            errorResponse.put(Constants.RedisFields.STATUS, AgentState.FAILED);
+            errorResponse.put("message_id", "");
+            errorResponse.put("target_agent_type", targetAgentType);
+            errorResponse.put("error", availResult.getReason());
+            errorResponse.put("error_code", availResult.getErrorCode() != null ? availResult.getErrorCode() : "ERR_AGENT_TYPE_UNAVAILABLE");
+            return errorResponse;
+        }
+
+        // Handle QUEUE_PENDING: router has stored the pending delivery, skip dispatch
+        if (AvailabilityStatus.QUEUE_PENDING.equals(availResult.getStatus())) {
+            Map<String, Object> response = new HashMap<>();
+            response.put(Constants.RedisFields.STATUS, AvailabilityStatus.QUEUE_PENDING);
+            response.put("message_id", msgId);
+            response.put("parent_message_id", currentMessageId);
+            response.put("target_agent_type", targetAgentType);
+            return response;
+        }
+
+        // Determine selected agent type (may differ due to fallback)
+        String selectedAgentType = availResult.getSelectedAgentType() != null
+                ? availResult.getSelectedAgentType() : targetAgentType;
+
         AskAgentCommand command = AskAgentCommand.of(
                 MessageHeader.builder()
                         .messageId(msgId)
                         .sessionId(sessionId)
                         .traceId(traceId)
                         .sourceAgentType(waitForReply ? currentAgentType : "")
-                        .targetAgentType(targetAgentType)
+                        .targetAgentType(selectedAgentType)
                         .parentMessageId(currentMessageId)
                         .taskGroupId(taskGroupId != null ? taskGroupId : "")
                         .metadata(metadata != null ? metadata : new HashMap<>())
@@ -297,27 +352,32 @@ public class AgentContext {
                 waitForReply,
                 payload != null ? new HashMap<>(payload) : new HashMap<>());
 
+        // Dispatch to the resolved stream
+        String resolvedStream = availResult.getStreamName() != null
+                ? availResult.getStreamName()
+                : Constants.QueueNames.ctrlStream(selectedAgentType);
+
         try (Jedis jedis = redisClient.getResource()) {
             Map<String, String> fields = new HashMap<>();
             fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(command));
-            jedis.xadd(Constants.QueueNames.ctrlStream(targetAgentType), (StreamEntryID) null,
-                    fields);
+            jedis.xadd(resolvedStream, (StreamEntryID) null, fields);
         } catch (Exception e) {
             throw new RuntimeException("Failed to enqueue agent call", e);
         }
 
         // Initialize execution tracking for the dispatched task
         try {
-            workerRegistry.initializeExecution(executionId, msgId, sessionId, targetAgentType, currentMessageId);
+            workerRegistry.initializeExecution(executionId, msgId, sessionId, selectedAgentType, currentMessageId);
         } catch (Exception e) {
             log.warn("Failed to initialize execution tracking for callAgent: {}", e.getMessage());
         }
 
         Map<String, Object> response = new HashMap<>();
-        response.put(Constants.RedisFields.STATUS, AgentState.QUEUED);
+        response.put(Constants.RedisFields.STATUS, AvailabilityStatus.WAIT_AND_DELIVER.equals(availResult.getStatus())
+                ? AvailabilityStatus.WAIT_AND_DELIVER : AgentState.QUEUED);
         response.put("message_id", msgId);
         response.put("parent_message_id", currentMessageId);
-        response.put("target_agent_type", targetAgentType);
+        response.put("target_agent_type", selectedAgentType);
         return response;
     }
 

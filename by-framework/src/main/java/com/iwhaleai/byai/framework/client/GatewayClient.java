@@ -4,6 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityResult;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityRouter;
+import com.iwhaleai.byai.framework.core.availability.AvailabilityStatus;
+import com.iwhaleai.byai.framework.core.availability.DeliveryIntent;
+import com.iwhaleai.byai.framework.core.availability.RoutePolicy;
 import com.iwhaleai.byai.framework.core.protocol.ActionType;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.AskAgentCommand;
@@ -32,6 +37,7 @@ import java.util.UUID;
 public class GatewayClient<T> {
     private final RedisClient redisClient;
     private final WorkerRegistry registry;
+    private final AvailabilityRouter availabilityRouter;
     @Getter
     private final List<GatewayInterceptor> interceptors;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -48,6 +54,7 @@ public class GatewayClient<T> {
         this.redisClient = redisClient;
         this.registry = registry;
         this.interceptors = interceptors != null ? interceptors : new ArrayList<>();
+        this.availabilityRouter = new AvailabilityRouter(redisClient, registry);
     }
 
     public GatewayClient(String host, int port) {
@@ -89,58 +96,80 @@ public class GatewayClient<T> {
      * 发送异步消息给指定的 Agent 类型。
      */
     public synchronized SendResponse sendCommand(GatewayCommand command) {
-        return sendCommand(command, null, null, false);
+        return sendCommand(command, null, null, RoutePolicy.FAIL_FAST);
     }
 
     public synchronized SendResponse sendCommand(GatewayCommand command, String streamName) {
-        return sendCommand(command, streamName, null, false);
+        return sendCommand(command, streamName, null, RoutePolicy.FAIL_FAST);
     }
 
+    /**
+     * Send a command with route policy control.
+     *
+     * @param command     The gateway command
+     * @param streamName  Optional explicit stream name (bypasses routing)
+     * @param targetWorkerId Optional direct worker ID
+     * @param routePolicy Route policy for availability check
+     * @return SendResponse
+     */
     public synchronized SendResponse sendCommand(GatewayCommand command, String streamName, String targetWorkerId,
-            boolean requireOnlineWorker) {
+            String routePolicy) {
         try {
             MessageHeader header = command.header();
 
-            if (requireOnlineWorker) {
-                if (targetWorkerId == null || targetWorkerId.isEmpty()) {
-                    WorkerRegistry.OnlineAgentCheckResult result = registry.hasOnlineAgentType(
-                            header.targetAgentType(),
-                            true,
-                            Constants.SD_DEFAULT_HEALTH_THRESHOLD_MS);
-                    if (!result.exists) {
-                        return SendResponse.builder()
-                                .success(false)
-                                .status(ExecutionStatus.FAILED)
-                                .targetWorkerId("")
-                                .error("No online worker found for agent_type '" + header.targetAgentType() + "'")
-                                .errorCode(ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE)
-                                .timestamp(System.currentTimeMillis())
-                                .build();
-                    }
-                } else {
-                    if (!registry.isWorkerOnline(targetWorkerId)) {
-                        return SendResponse.builder()
-                                .success(false)
-                                .status(ExecutionStatus.FAILED)
-                                .targetWorkerId(targetWorkerId)
-                                .error("Target worker '" + targetWorkerId + "' is not online or not registered")
-                                .errorCode(ExecutionStatus.ERR_WORKER_NOT_ONLINE)
-                                .timestamp(System.currentTimeMillis())
-                                .build();
-                    }
-                }
+            // Use AvailabilityRouter for the online check
+            DeliveryIntent intent = DeliveryIntent.builder()
+                    .executionId(null) // sendCommand doesn't have execution ID at this level
+                    .messageId(header.messageId())
+                    .sessionId(header.sessionId())
+                    .traceId(header.traceId())
+                    .source(header.sourceAgentType())
+                    .targetAgentType(header.targetAgentType())
+                    .userCode(header.userCode())
+                    .policy(routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST)
+                    .build();
+
+            AvailabilityResult result = availabilityRouter.prepareDelivery(intent);
+
+            if (AvailabilityStatus.REJECT.equals(result.getStatus())) {
+                return SendResponse.builder()
+                        .success(false)
+                        .status(ExecutionStatus.FAILED)
+                        .targetWorkerId("")
+                        .error(result.getReason())
+                        .errorCode(result.getErrorCode() != null ? result.getErrorCode() : ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
             }
 
+            if (AvailabilityStatus.QUEUE_PENDING.equals(result.getStatus())) {
+                return SendResponse.builder()
+                        .success(true)
+                        .messageId(header.messageId())
+                        .traceId(header.traceId())
+                        .status(AvailabilityStatus.QUEUE_PENDING)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+            }
+
+            // DELIVER_NOW, WAIT_AND_DELIVER, FALLBACK_TO_OTHER_AGENT_TYPE
             String resolvedStreamName = streamName;
             if (resolvedStreamName == null || resolvedStreamName.isBlank()) {
                 if (targetWorkerId != null && !targetWorkerId.isBlank()) {
                     resolvedStreamName = Constants.QueueNames.workerCtrlStream(targetWorkerId);
+                } else if (result.getStreamName() != null && !result.getStreamName().isBlank()) {
+                    resolvedStreamName = result.getStreamName();
                 } else {
-                    resolvedStreamName = Constants.QueueNames.ctrlStream(header.targetAgentType());
+                    String selectedType = result.getSelectedAgentType() != null
+                            ? result.getSelectedAgentType() : header.targetAgentType();
+                    resolvedStreamName = Constants.QueueNames.ctrlStream(selectedType);
                 }
             }
 
             String workerId = targetWorkerId != null ? targetWorkerId : "";
+            if (result.getTargetWorkerId() != null && !result.getTargetWorkerId().isBlank()) {
+                workerId = result.getTargetWorkerId();
+            }
 
             String jsonPayload = objectMapper.writeValueAsString(command);
             try (Jedis jedis = redisClient.getResource()) {
@@ -391,25 +420,28 @@ public class GatewayClient<T> {
             Map<String, Object> payload,
             Map<String, Object> metadata) {
         return sendMessage(targetAgentType, sessionId, content, userCode, userName, actionType, parentMessageId, messageId,
-                traceId, payload, metadata, null, true);
+                traceId, payload, metadata, null, RoutePolicy.FAIL_FAST, 0, null, null);
     }
 
     /**
-     * Send a message to the gateway with full control over routing and online worker check.
+     * Send a message to the gateway with full control over routing and availability.
      *
-     * @param targetAgentType Target agent type for routing
-     * @param sessionId Session ID
-     * @param content Message content
-     * @param userCode User Code
-     * @param userName User Name
-     * @param actionType Action type (ASK_AGENT or RESUME)
-     * @param parentMessageId Parent message ID for message chaining
-     * @param messageId Optional message ID (generated if null)
-     * @param traceId Optional trace ID (generated if null)
-     * @param payload Optional payload
-     * @param metadata Optional metadata
-     * @param targetWorkerId Optional direct worker ID (bypasses agent-type routing)
-     * @param requireOnlineWorker If true, check that target route has online worker before sending
+     * @param targetAgentType      Target agent type for routing
+     * @param sessionId            Session ID
+     * @param content              Message content
+     * @param userCode             User Code
+     * @param userName             User Name
+     * @param actionType           Action type (ASK_AGENT or RESUME)
+     * @param parentMessageId      Parent message ID for message chaining
+     * @param messageId            Optional message ID (generated if null)
+     * @param traceId              Optional trace ID (generated if null)
+     * @param payload              Optional payload
+     * @param metadata             Optional metadata
+     * @param targetWorkerId       Optional direct worker ID (bypasses agent-type routing)
+     * @param routePolicy          Route policy for availability control (FAIL_FAST, SEND_ANYWAY, etc.)
+     * @param availabilityTimeoutMs Timeout for WAKE_AND_WAIT policy
+     * @param region               Optional region for routing
+     * @param priority             Optional priority for routing
      * @return SendResponse with success status and details
      */
     public synchronized SendResponse sendMessage(
@@ -425,7 +457,10 @@ public class GatewayClient<T> {
             Map<String, Object> payload,
             Map<String, Object> metadata,
             String targetWorkerId,
-            boolean requireOnlineWorker) {
+            String routePolicy,
+            long availabilityTimeoutMs,
+            String region,
+            String priority) {
         // 1. Prepare parameters for interceptors
         SendMessageParams params = SendMessageParams.builder()
                 .targetAgentType(targetAgentType)
@@ -452,12 +487,62 @@ public class GatewayClient<T> {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
 
+        String executionId = Constants.EXECUTION_ID_PREFIX
+                + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+        String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
+
         try {
+            // Build delivery intent for availability routing
+            DeliveryIntent intent = DeliveryIntent.builder()
+                    .executionId(executionId)
+                    .messageId(messageId)
+                    .sessionId(params.getSessionId())
+                    .traceId(traceId)
+                    .source("")
+                    .targetAgentType(params.getTargetAgentType())
+                    .userCode(params.getUserCode())
+                    .region(region)
+                    .priority(priority)
+                    .policy(resolvedPolicy)
+                    .timeoutMs(availabilityTimeoutMs)
+                    .metadata(params.getMetadata())
+                    .build();
+
+            AvailabilityResult availResult = availabilityRouter.prepareDelivery(intent);
+
+            // Handle QUEUE_PENDING: command stored by router, skip dispatch
+            if (AvailabilityStatus.QUEUE_PENDING.equals(availResult.getStatus())) {
+                return SendResponse.builder()
+                        .success(true)
+                        .messageId(messageId)
+                        .traceId(traceId)
+                        .status(AvailabilityStatus.QUEUE_PENDING)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+            }
+
+            // Handle REJECT
+            if (AvailabilityStatus.REJECT.equals(availResult.getStatus())) {
+                return SendResponse.builder()
+                        .success(false)
+                        .messageId(messageId)
+                        .traceId(traceId)
+                        .status(ExecutionStatus.FAILED)
+                        .error(availResult.getReason())
+                        .errorCode(availResult.getErrorCode() != null ? availResult.getErrorCode() : ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+            }
+
+            // Determine the actual agent type for header (may differ due to fallback)
+            String selectedAgentType = availResult.getSelectedAgentType() != null
+                    ? availResult.getSelectedAgentType() : params.getTargetAgentType();
+
             MessageHeader header = MessageHeader.builder()
                     .messageId(messageId)
                     .sessionId(params.getSessionId())
                     .traceId(traceId)
-                    .targetAgentType(params.getTargetAgentType())
+                    .targetAgentType(selectedAgentType)
                     .parentMessageId(params.getParentMessageId())
                     .userCode(params.getUserCode())
                     .userName(params.getUserName())
@@ -485,30 +570,41 @@ public class GatewayClient<T> {
                                     .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()),
                                             HashMap::putAll));
 
-            String executionId = Constants.EXECUTION_ID_PREFIX
-                    + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
             try {
                 registry.initializeExecution(executionId, messageId, params.getSessionId(),
-                        params.getTargetAgentType(), params.getParentMessageId());
+                        selectedAgentType, params.getParentMessageId());
             } catch (Exception e) {
                 log.warn("Failed to initialize execution tracking: {}", e.getMessage());
             }
 
-            SendResponse response = sendCommand((GatewayCommand) command, null, targetWorkerId, requireOnlineWorker);
-            if (response.isSuccess()) {
-                log.info("Message sent to gateway: {} (target={})", messageId, params.getTargetAgentType());
+            // Dispatch to resolved stream
+            String resolvedStream;
+            if (targetWorkerId != null && !targetWorkerId.isBlank()) {
+                resolvedStream = Constants.QueueNames.workerCtrlStream(targetWorkerId);
+            } else if (availResult.getStreamName() != null) {
+                resolvedStream = availResult.getStreamName();
+            } else {
+                resolvedStream = Constants.QueueNames.ctrlStream(selectedAgentType);
             }
 
-            // Ensure traceId is in the response
+            String jsonPayload = objectMapper.writeValueAsString(command);
+            try (Jedis jedis = redisClient.getResource()) {
+                Map<String, String> redisData = new HashMap<>();
+                redisData.put(Constants.RedisFields.DATA, jsonPayload);
+                jedis.xadd(resolvedStream, (redis.clients.jedis.StreamEntryID) null, redisData);
+            }
+
+            log.info("Message sent to gateway: {} (target={}, stream={})", messageId, selectedAgentType, resolvedStream);
+
             return SendResponse.builder()
-                    .success(response.isSuccess())
-                    .messageId(response.getMessageId())
+                    .success(true)
+                    .messageId(messageId)
                     .traceId(traceId)
-                    .targetWorkerId(response.getTargetWorkerId())
-                    .status(response.getStatus())
+                    .targetWorkerId(targetWorkerId != null ? targetWorkerId
+                            : (availResult.getTargetWorkerId() != null ? availResult.getTargetWorkerId() : ""))
+                    .status(AvailabilityStatus.WAIT_AND_DELIVER.equals(availResult.getStatus())
+                            ? AvailabilityStatus.WAIT_AND_DELIVER : ExecutionStatus.QUEUED)
                     .timestamp(System.currentTimeMillis())
-                    .error(response.getError())
-                    .errorCode(response.getErrorCode())
                     .build();
 
         } catch (Exception e) {

@@ -90,6 +90,28 @@ public static final int MAX_RETRY_COUNT = 3;
         public static String workerCtrlStream(String workerId) {
             return REDIS_PREFIX + "ctrl:worker:" + workerId;
         }
+
+        // -- Control Plane (Agent Availability) --
+
+        public static String controlPlaneManagementStream() {
+            return REDIS_PREFIX + "control_plane:management_stream";
+        }
+
+        public static String controlPlaneDecisionStream(String executionId) {
+            return REDIS_PREFIX + "control_plane:decision:" + executionId;
+        }
+
+        public static String controlPlanePendingQueue(String agentType) {
+            return REDIS_PREFIX + "control_plane:pending:" + agentType;
+        }
+
+        public static String controlPlaneCircuitBreakerKey() {
+            return REDIS_PREFIX + "control_plane:circuit_breaker";
+        }
+
+        public static String controlPlaneQuotaKey(String tenantId) {
+            return REDIS_PREFIX + "control_plane:quota:" + tenantId;
+        }
     }
 
     public static class RegistryKeys {

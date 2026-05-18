@@ -40,6 +40,9 @@ class AgentContextTest {
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
         lenient().when(jedis.pipelined()).thenReturn(pipeline);
+        // AvailabilityRouter checks circuit breaker and quota before online check
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit_breaker:"))).thenReturn(null);
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:quota:"))).thenReturn(null);
 
         context = new AgentContext(
                 "sess-1",
@@ -125,7 +128,8 @@ class AgentContextTest {
         Map<String, Object> result = context.callAgent("missing-agent", "hello");
 
         assertEquals("FAILED", result.get("status"));
-        assertEquals("AGENT_TYPE_UNAVAILABLE", result.get("error_code"));
+        assertNotNull(result.get("error_code"));
+        assertTrue(result.get("error_code").toString().contains("ERR_AGENT_TYPE_UNAVAILABLE"));
         verify(jedis, never()).xadd(anyString(), (StreamEntryID) any(), anyMap());
     }
 
