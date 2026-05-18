@@ -50,12 +50,32 @@ jobs:
         run: mvn -B clean verify
 
       - name: Stage to Maven Central
-        run: mvn -B deploy -P release
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
           MAVEN_GPG_KEY: ${{ secrets.MAVEN_GPG_KEY }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          # Import GPG private key for artifact signing
+          echo "$MAVEN_GPG_KEY" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^sec' | head -1 | cut -d: -f5)
+
+          # Create Maven settings.xml with Maven Central credentials
+          cat > ~/.m2/settings.xml <<SETTINGS
+          <settings>
+            <servers>
+              <server>
+                <id>central</id>
+                <username>${MAVEN_CENTRAL_USERNAME}</username>
+                <password>${MAVEN_CENTRAL_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          SETTINGS
+
+          mvn -B deploy -P release \
+            -Dgpg.keyname="${GPG_KEY_ID}" \
+            -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}"
 
   post-release:
     runs-on: ubuntu-latest
