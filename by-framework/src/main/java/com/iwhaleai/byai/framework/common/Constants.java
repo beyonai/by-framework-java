@@ -22,6 +22,7 @@ public class Constants {
         public static final String EXECUTION_ID = "execution_id";
         public static final String MESSAGE_ID = "message_id";
         public static final String SESSION_ID = "session_id";
+        public static final String TRACE_ID = "trace_id";
         public static final String WORKER_ID = "worker_id";
         public static final String STATUS = "status";
         public static final String TARGET_AGENT_TYPE = "target_agent_type";

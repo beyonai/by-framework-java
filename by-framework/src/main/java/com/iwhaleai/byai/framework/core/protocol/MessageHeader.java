@@ -19,6 +19,8 @@ public record MessageHeader(
     @JsonProperty("task_group_id") String taskGroupId,
     @JsonProperty("user_code") String userCode,
     @JsonProperty("user_name") String userName,
+    @JsonProperty("trace_parent_span_id") String traceParentSpanId,
+    @JsonProperty("langfuse_parent_observation_id") String langfuseParentObservationId,
     @JsonProperty("metadata") Map<String, Object> metadata
 ) {
     /**
@@ -33,6 +35,8 @@ public record MessageHeader(
         taskGroupId = taskGroupId != null ? taskGroupId : "";
         userCode = userCode != null ? userCode : "";
         userName = userName != null ? userName : "";
+        traceParentSpanId = traceParentSpanId != null ? traceParentSpanId : "";
+        langfuseParentObservationId = langfuseParentObservationId != null ? langfuseParentObservationId : "";
         metadata = metadata != null ? metadata : Map.of();
     }
 
@@ -56,6 +60,8 @@ public record MessageHeader(
         private String taskGroupId = "";
         private String userCode = "";
         private String userName = "";
+        private String traceParentSpanId = "";
+        private String langfuseParentObservationId = "";
         private Map<String, Object> metadata = Map.of();
 
         private Builder() {
@@ -106,6 +112,16 @@ public record MessageHeader(
             return this;
         }
 
+        public Builder traceParentSpanId(String traceParentSpanId) {
+            this.traceParentSpanId = traceParentSpanId;
+            return this;
+        }
+
+        public Builder langfuseParentObservationId(String langfuseParentObservationId) {
+            this.langfuseParentObservationId = langfuseParentObservationId;
+            return this;
+        }
+
         public Builder metadata(Map<String, Object> metadata) {
             this.metadata = metadata != null ? metadata : Map.of();
             return this;
@@ -114,7 +130,8 @@ public record MessageHeader(
         public MessageHeader build() {
             return new MessageHeader(
                 messageId, sessionId, traceId, sourceAgentType, targetAgentType,
-                parentMessageId, taskGroupId, userCode, userName, metadata
+                parentMessageId, taskGroupId, userCode, userName,
+                traceParentSpanId, langfuseParentObservationId, metadata
             );
         }
     }

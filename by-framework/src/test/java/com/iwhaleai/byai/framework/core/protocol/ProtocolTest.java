@@ -374,8 +374,31 @@ class ProtocolTest {
                 assertEquals("", header.taskGroupId());
                 assertEquals("", header.userCode());
                 assertEquals("", header.userName());
+                assertEquals("", header.traceParentSpanId());
+                assertEquals("", header.langfuseParentObservationId());
                 assertNotNull(header.metadata());
                 assertTrue(header.metadata().isEmpty());
+        }
+
+        @Test
+        void messageHeaderSerializesTraceParentFields() throws Exception {
+                MessageHeader header = MessageHeader.builder()
+                                .messageId("msg-1")
+                                .sessionId("sess-1")
+                                .traceId("trace-1")
+                                .traceParentSpanId("0123456789abcdef")
+                                .langfuseParentObservationId("obs-parent")
+                                .build();
+
+                String json = objectMapper.writeValueAsString(header);
+                Map<?, ?> payload = objectMapper.readValue(json, Map.class);
+
+                assertEquals("0123456789abcdef", payload.get("trace_parent_span_id"));
+                assertEquals("obs-parent", payload.get("langfuse_parent_observation_id"));
+
+                MessageHeader decoded = objectMapper.readValue(json, MessageHeader.class);
+                assertEquals("0123456789abcdef", decoded.traceParentSpanId());
+                assertEquals("obs-parent", decoded.langfuseParentObservationId());
         }
 
         @Test
