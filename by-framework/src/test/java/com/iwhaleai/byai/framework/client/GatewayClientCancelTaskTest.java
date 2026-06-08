@@ -1,7 +1,10 @@
 package com.iwhaleai.byai.framework.client;
 
+import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
+import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
+import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -63,6 +66,30 @@ class GatewayClientCancelTaskTest {
         assertEquals(0, response.getCancelledCount());
     }
 
+    @Test
+    void cancelTaskPropagatesOriginalTraceIdToCancelCommand() {
+        Map<String, Object> exec = new HashMap<>();
+        exec.put(Constants.ExecutionFields.EXECUTION_ID, "exec-1");
+        exec.put(Constants.ExecutionFields.MESSAGE_ID, "msg-1");
+        exec.put(Constants.ExecutionFields.SESSION_ID, "sess-1");
+        exec.put(Constants.ExecutionFields.TRACE_ID, "trace-original");
+        exec.put(Constants.ExecutionFields.WORKER_ID, "worker-123");
+        exec.put(Constants.ExecutionFields.TARGET_AGENT_TYPE, "demo-agent");
+        exec.put(Constants.ExecutionFields.STATUS, "RUNNING");
+
+        CapturingGatewayClient client = new CapturingGatewayClient(
+                redisClient,
+                new FakeRegistry(redisClient, exec, Map.of("exec-1", exec))
+        );
+
+        GatewayClient.CancelTaskResponse response = client.cancelTask("msg-1", "sess-1");
+
+        assertTrue(response.isSuccess());
+        CancelTaskCommand command = (CancelTaskCommand) client.lastCommand;
+        assertEquals("trace-original", command.header().traceId());
+        assertEquals("msg-1", command.header().parentMessageId());
+    }
+
     private static class FakeRegistry extends WorkerRegistry {
         private final Map<String, Object> execution;
         private final Map<String, Map<String, Object>> allExecutions;
@@ -92,6 +119,26 @@ class GatewayClientCancelTaskTest {
         @Override
         public synchronized void markCancelRequested(String executionId, String sessionId, String reason) {
             // no-op
+        }
+    }
+
+    private static class CapturingGatewayClient extends GatewayClient<Object> {
+        private GatewayCommand lastCommand;
+
+        CapturingGatewayClient(RedisClient redisClient, WorkerRegistry registry) {
+            super(redisClient, registry, List.of());
+        }
+
+        @Override
+        public synchronized SendResponse sendCommand(GatewayCommand command, String streamName) {
+            this.lastCommand = command;
+            return SendResponse.builder()
+                    .success(true)
+                    .messageId(command.header().messageId())
+                    .traceId(command.header().traceId())
+                    .status("QUEUED")
+                    .timestamp(System.currentTimeMillis())
+                    .build();
         }
     }
 }

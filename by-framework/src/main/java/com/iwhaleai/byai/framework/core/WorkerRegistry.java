@@ -470,11 +470,27 @@ public class WorkerRegistry {
      */
     public synchronized void initializeExecution(String executionId, String messageId, String sessionId,
                                                   String targetAgentType, String parentMessageId) {
+        initializeExecution(executionId, messageId, sessionId, targetAgentType, parentMessageId, "");
+    }
+
+    /**
+     * Initialize a new execution with QUEUED status, timestamps, and trace id.
+     *
+     * @param executionId Execution ID
+     * @param messageId Message ID
+     * @param sessionId Session ID
+     * @param targetAgentType Target agent type
+     * @param parentMessageId Parent message ID (for tracking hierarchy)
+     * @param traceId Trace ID for cancellation and observability correlation
+     */
+    public synchronized void initializeExecution(String executionId, String messageId, String sessionId,
+                                                  String targetAgentType, String parentMessageId, String traceId) {
         long now = System.currentTimeMillis();
         Map<String, Object> execution = new HashMap<>();
         execution.put(Constants.ExecutionFields.EXECUTION_ID, executionId);
         execution.put(Constants.ExecutionFields.MESSAGE_ID, messageId);
         execution.put(Constants.ExecutionFields.SESSION_ID, sessionId);
+        execution.put(Constants.ExecutionFields.TRACE_ID, traceId != null ? traceId : "");
         execution.put(Constants.ExecutionFields.TARGET_AGENT_TYPE, targetAgentType != null ? targetAgentType : "");
         execution.put(Constants.ExecutionFields.STATUS, AgentState.QUEUED);
         execution.put(Constants.ExecutionFields.CREATED_AT, now);

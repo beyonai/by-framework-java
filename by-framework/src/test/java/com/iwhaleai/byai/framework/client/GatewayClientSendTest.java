@@ -89,7 +89,8 @@ class GatewayClientSendTest {
                 eq("msg-order"),
                 eq("sess-1"),
                 eq("demo-agent"),
-                eq(""));
+                eq(""),
+                eq("trace-order"));
         inOrder.verify(jedis).xadd(
                 eq(Constants.QueueNames.ctrlStream("demo-agent")),
                 (StreamEntryID) isNull(),
@@ -137,6 +138,109 @@ class GatewayClientSendTest {
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
         assertEquals("test-user", cmd.header().metadata().get("user"));
         assertEquals("high", cmd.header().metadata().get("priority"));
+    }
+
+    @Test
+    void sendMessagePromotesTraceParentFieldsFromMetadataToHeader() throws Exception {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("request_id", "req-1");
+        metadata.put("trace_parent_span_id", "0123456789abcdef");
+        metadata.put("langfuse_parent_observation_id", "obs-client-dispatch");
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, null, "msg-client", "trace-client", null, metadata);
+
+        assertTrue(response.isSuccess());
+
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+
+        String dataJson = fieldsCaptor.getValue().get("data");
+        AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
+        assertEquals("0123456789abcdef", cmd.header().traceParentSpanId());
+        assertEquals("obs-client-dispatch", cmd.header().langfuseParentObservationId());
+        assertEquals(Map.of("request_id", "req-1"), cmd.header().metadata());
+    }
+
+    @Test
+    void sendMessageStartsLangfuseClientDispatchForRootCommand() throws Exception {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        FakeClientDispatchTracer tracer = new FakeClientDispatchTracer("obs-client-dispatch");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of(), tracer);
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                "user-1", "User One", null, "", "msg-client", "trace-client", null,
+                Map.of("request_id", "req-1"));
+
+        assertTrue(response.isSuccess());
+        assertEquals(1, tracer.startCalls.size());
+        ClientDispatchTracer.ClientDispatchRequest start = tracer.startCalls.get(0);
+        assertEquals("trace-client", start.traceId());
+        assertEquals("msg-client", start.messageId());
+        assertEquals("demo-agent", start.targetAgentType());
+        assertEquals("sess-1", start.sessionId());
+        assertEquals("user-1", start.userCode());
+        assertEquals("hello", start.content());
+        assertEquals(Map.of("request_id", "req-1"), start.metadata());
+        assertEquals("060f92f2a4dc5da4", start.observationId());
+        assertEquals(1, tracer.observation.endCalls.size());
+
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+
+        String dataJson = fieldsCaptor.getValue().get("data");
+        AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
+        assertEquals("obs-client-dispatch", cmd.header().langfuseParentObservationId());
+        assertEquals("060f92f2a4dc5da4", cmd.header().traceParentSpanId());
+    }
+
+    @Test
+    void sendMessageDoesNotStartLangfuseClientDispatchForChildCommand() throws Exception {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        FakeClientDispatchTracer tracer = new FakeClientDispatchTracer("obs-new-root");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of(), tracer);
+
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("langfuse_parent_observation_id", "obs-existing-parent");
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, "msg-parent", "msg-child", "trace-client", null, metadata);
+
+        assertTrue(response.isSuccess());
+        assertTrue(tracer.startCalls.isEmpty());
+
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+
+        String dataJson = fieldsCaptor.getValue().get("data");
+        AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
+        assertEquals("obs-existing-parent", cmd.header().langfuseParentObservationId());
+        assertEquals("msg-parent", cmd.header().parentMessageId());
+    }
+
+    @Test
+    void sendMessageDefaultsTraceParentSpanIdToClientDispatchSpan() throws Exception {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, null, "msg-client", "trace-client", null, null);
+
+        assertTrue(response.isSuccess());
+
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+
+        String dataJson = fieldsCaptor.getValue().get("data");
+        AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
+        assertEquals("060f92f2a4dc5da4", cmd.header().traceParentSpanId());
     }
 
     @Test
@@ -324,6 +428,12 @@ class GatewayClientSendTest {
         }
 
         @Override
+        public synchronized void initializeExecution(String executionId, String messageId, String sessionId,
+                String targetAgentType, String parentMessageId, String traceId) {
+            // Tests verify call ordering; no Redis write is needed here.
+        }
+
+        @Override
         public String getTargetWorker(String agentType) {
             return targetWorker;
         }
@@ -341,4 +451,40 @@ class GatewayClientSendTest {
             return targetWorker != null && targetWorker.equals(workerId);
         }
     }
+
+    private static class FakeClientDispatchTracer implements ClientDispatchTracer {
+        private final FakeClientDispatchObservation observation;
+        private final List<ClientDispatchRequest> startCalls = new ArrayList<>();
+
+        FakeClientDispatchTracer(String observationId) {
+            this.observation = new FakeClientDispatchObservation(observationId);
+        }
+
+        @Override
+        public ClientDispatchObservation start(ClientDispatchRequest request) {
+            startCalls.add(request);
+            return observation;
+        }
+    }
+
+    private static class FakeClientDispatchObservation implements ClientDispatchObservation {
+        private final String id;
+        private final List<EndCall> endCalls = new ArrayList<>();
+
+        FakeClientDispatchObservation(String id) {
+            this.id = id;
+        }
+
+        @Override
+        public String id() {
+            return id;
+        }
+
+        @Override
+        public void end(Object output, String error) {
+            endCalls.add(new EndCall(output, error));
+        }
+    }
+
+    private record EndCall(Object output, String error) { }
 }

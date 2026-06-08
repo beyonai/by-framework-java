@@ -20,6 +20,9 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import redis.clients.jedis.Jedis;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -30,11 +33,15 @@ import java.util.UUID;
 
 @Slf4j
 public class GatewayClient<T> {
+    private static final String TRACE_PARENT_SPAN_ID = "trace_parent_span_id";
+    private static final String LANGFUSE_PARENT_OBSERVATION_ID = "langfuse_parent_observation_id";
+
     private final RedisClient redisClient;
     private final WorkerRegistry registry;
     @Getter
     private final List<GatewayInterceptor> interceptors;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ClientDispatchTracer clientDispatchTracer;
 
     public GatewayClient(RedisClient redisClient) {
         this(redisClient, new WorkerRegistry(redisClient), new ArrayList<>());
@@ -45,9 +52,18 @@ public class GatewayClient<T> {
     }
 
     public GatewayClient(RedisClient redisClient, WorkerRegistry registry, List<GatewayInterceptor> interceptors) {
+        this(redisClient, registry, interceptors, new LangfuseClientDispatchTracer());
+    }
+
+    GatewayClient(
+            RedisClient redisClient,
+            WorkerRegistry registry,
+            List<GatewayInterceptor> interceptors,
+            ClientDispatchTracer clientDispatchTracer) {
         this.redisClient = redisClient;
         this.registry = registry;
         this.interceptors = interceptors != null ? interceptors : new ArrayList<>();
+        this.clientDispatchTracer = clientDispatchTracer;
     }
 
     public GatewayClient(String host, int port) {
@@ -56,6 +72,65 @@ public class GatewayClient<T> {
 
     public void addInterceptor(GatewayInterceptor interceptor) {
         this.interceptors.add(interceptor);
+    }
+
+    /**
+     * Convert a stable span key to the same 16-char hex span id used by Python.
+     */
+    public static String stableTraceSpanIdHex(String value) {
+        String normalized = value != null ? value : "";
+        if (normalized.length() == 16 && isHex(normalized)) {
+            return normalized.toLowerCase();
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            byte[] hash = digest.digest(normalized.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder(16);
+            for (int i = 0; i < 8; i++) {
+                builder.append(String.format("%02x", hash[i] & 0xff));
+            }
+            String spanId = builder.toString();
+            return "0000000000000000".equals(spanId) ? "0000000000000001" : spanId;
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 digest is unavailable", e);
+        }
+    }
+
+    /**
+     * Convert a framework trace id to the same 32-char hex trace id used by Python.
+     */
+    public static String stableTraceIdHex(String value) {
+        String normalized = value != null ? value : "";
+        if (normalized.length() == 32 && isHex(normalized)) {
+            return normalized.toLowerCase();
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            byte[] hash = digest.digest(normalized.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder(32);
+            for (byte b : hash) {
+                builder.append(String.format("%02x", b & 0xff));
+            }
+            String traceId = builder.toString();
+            return "00000000000000000000000000000000".equals(traceId)
+                    ? "00000000000000000000000000000001"
+                    : traceId;
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 digest is unavailable", e);
+        }
+    }
+
+    private static boolean isHex(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            boolean digit = c >= '0' && c <= '9';
+            boolean lower = c >= 'a' && c <= 'f';
+            boolean upper = c >= 'A' && c <= 'F';
+            if (!digit && !lower && !upper) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Data
@@ -352,7 +427,7 @@ public class GatewayClient<T> {
                         .messageId(Constants.CANCEL_MESSAGE_ID_PREFIX
                                 + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH))
                         .sessionId(sessionId)
-                        .traceId(UUID.randomUUID().toString().replace("-", ""))
+                        .traceId(resolveExecutionTraceId(taskExec))
                         .targetAgentType(
                                 targetAgentType != null && !targetAgentType.isBlank()
                                         ? targetAgentType
@@ -453,6 +528,30 @@ public class GatewayClient<T> {
         }
 
         try {
+            Map<String, Object> headerMetadata = new HashMap<>(
+                    params.getMetadata() != null ? params.getMetadata() : Map.of());
+            String traceParentSpanId = stringValue(headerMetadata.remove(TRACE_PARENT_SPAN_ID));
+            String langfuseParentObservationId = stringValue(headerMetadata.remove(LANGFUSE_PARENT_OBSERVATION_ID));
+            if (traceParentSpanId.isEmpty()) {
+                traceParentSpanId = stableTraceSpanIdHex(messageId + ":client.dispatch");
+            }
+            ClientDispatchObservation clientDispatchObservation = null;
+            if (params.getParentMessageId() == null || params.getParentMessageId().isBlank()) {
+                clientDispatchObservation = startClientDispatchObservation(
+                        traceId,
+                        messageId,
+                        params.getTargetAgentType(),
+                        params.getSessionId(),
+                        params.getUserCode(),
+                        params.getUserName(),
+                        params.getContent(),
+                        headerMetadata,
+                        traceParentSpanId);
+                if (clientDispatchObservation != null && !clientDispatchObservation.id().isBlank()) {
+                    langfuseParentObservationId = clientDispatchObservation.id();
+                }
+            }
+
             MessageHeader header = MessageHeader.builder()
                     .messageId(messageId)
                     .sessionId(params.getSessionId())
@@ -461,7 +560,9 @@ public class GatewayClient<T> {
                     .parentMessageId(params.getParentMessageId())
                     .userCode(params.getUserCode())
                     .userName(params.getUserName())
-                    .metadata(params.getMetadata())
+                    .traceParentSpanId(traceParentSpanId)
+                    .langfuseParentObservationId(langfuseParentObservationId)
+                    .metadata(headerMetadata)
                     .build();
 
             Map<String, Object> payloadMap = new HashMap<>(params.getPayload());
@@ -489,7 +590,7 @@ public class GatewayClient<T> {
                     + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
             try {
                 registry.initializeExecution(executionId, messageId, params.getSessionId(),
-                        params.getTargetAgentType(), params.getParentMessageId());
+                        params.getTargetAgentType(), params.getParentMessageId(), traceId);
             } catch (Exception e) {
                 log.warn("Failed to initialize execution tracking: {}", e.getMessage());
             }
@@ -498,6 +599,16 @@ public class GatewayClient<T> {
             if (response.isSuccess()) {
                 log.info("Message sent to gateway: {} (target={})", messageId, params.getTargetAgentType());
             }
+            endClientDispatchObservation(
+                    clientDispatchObservation,
+                    Map.of(
+                            "success", response.isSuccess(),
+                            "message_id", messageId,
+                            "trace_id", traceId,
+                            "target_worker_id", response.getTargetWorkerId() != null ? response.getTargetWorkerId() : "",
+                            "status", response.getStatus() != null ? response.getStatus() : ""
+                    ),
+                    response.isSuccess() ? "" : stringValue(response.getError()));
 
             // Ensure traceId is in the response
             return SendResponse.builder()
@@ -529,5 +640,55 @@ public class GatewayClient<T> {
 
     public SendResponse sendMessage(String targetAgentType, String sessionId, T content, Map<String, Object> metadata) {
         return sendMessage(targetAgentType, sessionId, content, null, null, null, null, null, null, null, metadata);
+    }
+
+    private static String stringValue(Object value) {
+        return value != null ? String.valueOf(value) : "";
+    }
+
+    private static String resolveExecutionTraceId(Map<String, Object> execution) {
+        String traceId = stringValue(execution.get(Constants.ExecutionFields.TRACE_ID));
+        return traceId.isEmpty() ? UUID.randomUUID().toString().replace("-", "") : traceId;
+    }
+
+    private ClientDispatchObservation startClientDispatchObservation(
+            String traceId,
+            String messageId,
+            String targetAgentType,
+            String sessionId,
+            String userCode,
+            String userName,
+            Object content,
+            Map<String, Object> metadata,
+            String observationId) {
+        try {
+            return clientDispatchTracer.start(new ClientDispatchTracer.ClientDispatchRequest(
+                    traceId,
+                    messageId,
+                    targetAgentType,
+                    sessionId,
+                    userCode,
+                    userName,
+                    content,
+                    metadata,
+                    observationId));
+        } catch (Exception e) {
+            log.warn("Langfuse client.dispatch observation skipped: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private void endClientDispatchObservation(
+            ClientDispatchObservation observation,
+            Object output,
+            String error) {
+        if (observation == null) {
+            return;
+        }
+        try {
+            observation.end(output, error);
+        } catch (Exception e) {
+            log.warn("Langfuse client.dispatch observation end skipped: {}", e.getMessage());
+        }
     }
 }
