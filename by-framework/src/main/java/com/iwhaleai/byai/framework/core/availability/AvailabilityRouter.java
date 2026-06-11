@@ -156,18 +156,58 @@ public class AvailabilityRouter {
         emitWakeup(intent);
         WakeupDecision decision = waitForWakeupDecision(intent);
 
-        if (WakeupDecisionStatus.READY.equals(decision.getStatus())) {
+        if (decision == null
+                || WakeupDecisionStatus.TIMEOUT.equals(decision.getStatus())) {
             return AvailabilityResult.builder()
-                    .status(AvailabilityStatus.WAIT_AND_DELIVER)
-                    .selectedAgentType(intent.getTargetAgentType())
-                    .streamName(Constants.QueueNames.ctrlStream(intent.getTargetAgentType()))
-                    .targetWorkerId(decision.getWorkerId())
+                    .status(AvailabilityStatus.REJECT)
+                    .reason("Timed out waiting for wakeup decision after " + intent.getTimeoutMs() + "ms")
+                    .errorCode(ExecutionStatusAdapter.ERR_AGENT_TYPE_UNAVAILABLE)
+                    .build();
+        }
+
+        if (WakeupDecisionStatus.FAILED.equals(decision.getStatus())
+                || WakeupDecisionStatus.REJECTED.equals(decision.getStatus())) {
+            return AvailabilityResult.builder()
+                    .status(AvailabilityStatus.REJECT)
+                    .reason(decision.getReason() != null && !decision.getReason().isEmpty()
+                            ? decision.getReason()
+                            : "Wakeup " + decision.getStatus())
+                    .errorCode(ExecutionStatusAdapter.ERR_AGENT_TYPE_UNAVAILABLE)
+                    .build();
+        }
+
+        if (WakeupDecisionStatus.FALLBACK.equals(decision.getStatus())) {
+            String targetAgent = decision.getSelectedAgentType() != null && !decision.getSelectedAgentType().isEmpty()
+                    ? decision.getSelectedAgentType()
+                    : decision.getReason();
+            return AvailabilityResult.builder()
+                    .status(AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE)
+                    .selectedAgentType(targetAgent)
+                    .streamName(Constants.QueueNames.ctrlStream(targetAgent))
+                    .build();
+        }
+
+        if (WakeupDecisionStatus.READY.equals(decision.getStatus())) {
+            // Recheck: worker may still not be online even after READY signal
+            if (hasOnlineAgentType(intent.getTargetAgentType())) {
+                return AvailabilityResult.builder()
+                        .status(AvailabilityStatus.WAIT_AND_DELIVER)
+                        .selectedAgentType(intent.getTargetAgentType())
+                        .streamName(Constants.QueueNames.ctrlStream(intent.getTargetAgentType()))
+                        .targetWorkerId(decision.getWorkerId())
+                        .build();
+            }
+            return AvailabilityResult.builder()
+                    .status(AvailabilityStatus.REJECT)
+                    .reason("Worker not online after wakeup READY for agent_type '"
+                            + intent.getTargetAgentType() + "'")
+                    .errorCode(ExecutionStatusAdapter.ERR_AGENT_TYPE_UNAVAILABLE)
                     .build();
         }
 
         return AvailabilityResult.builder()
                 .status(AvailabilityStatus.REJECT)
-                .reason("Wakeup " + decision.getStatus() + ": " + decision.getReason())
+                .reason("Unknown wakeup decision status: " + decision.getStatus())
                 .errorCode(ExecutionStatusAdapter.ERR_AGENT_TYPE_UNAVAILABLE)
                 .build();
     }
@@ -181,14 +221,14 @@ public class AvailabilityRouter {
         // Circuit breaker check
         if (isCircuitOpen(intent.getTargetAgentType())) {
             log.warn("Circuit breaker OPEN for agent_type='{}'", intent.getTargetAgentType());
-            return "Circuit breaker open for agent_type '" + intent.getTargetAgentType() + "'";
+            return getCircuitOpenReason(intent.getTargetAgentType());
         }
 
         // Quota check
         String tenantId = intent.getUserCode() != null ? intent.getUserCode() : "default";
         if (isQuotaExceeded(tenantId)) {
             log.warn("Quota exceeded for tenant='{}'", tenantId);
-            return "Quota exceeded for tenant '" + tenantId + "'";
+            return getQuotaExceededReason(tenantId);
         }
 
         return null;
@@ -204,11 +244,50 @@ public class AvailabilityRouter {
         return ExecutionStatusAdapter.ERR_AGENT_TYPE_UNAVAILABLE;
     }
 
+    // ---- Circuit breaker & Quota JSON Helpers ----
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> readJsonKey(String key) {
+        try (Jedis jedis = redisClient.getResource()) {
+            String raw = jedis.get(key);
+            if (raw == null || raw.isEmpty()) {
+                return null;
+            }
+            return OBJECT_MAPPER.readValue(raw, Map.class);
+        } catch (Exception e) {
+            log.warn("Failed to read/parse JSON key {}: {}", key, e.getMessage());
+            return null;
+        }
+    }
+
+    private String getCircuitOpenReason(String agentType) {
+        Map<String, Object> circuit = readJsonKey(Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType));
+        if (circuit != null && circuit.get("reason") != null) {
+            return String.valueOf(circuit.get("reason"));
+        }
+        return "Circuit breaker open for agent_type '" + agentType + "'";
+    }
+
+    private String getQuotaExceededReason(String tenantId) {
+        Map<String, Object> quota = readJsonKey(Constants.QueueNames.controlPlaneQuotaKey(tenantId));
+        if (quota != null && quota.get("reason") != null) {
+            return String.valueOf(quota.get("reason"));
+        }
+        return "Quota exceeded for tenant '" + tenantId + "'";
+    }
+
     // ---- Circuit breaker ----
 
     boolean isCircuitOpen(String agentType) {
+        // 1. Check control-plane JSON circuit key
+        Map<String, Object> circuit = readJsonKey(Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType));
+        if (circuit != null) {
+            return "OPEN".equalsIgnoreCase(String.valueOf(circuit.get("state")));
+        }
+
+        // 2. Fallback: check SDK-local failure count key
         try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey() + ":" + agentType;
+            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
             String value = jedis.get(key);
             if (value == null) {
                 return false;
@@ -227,7 +306,7 @@ public class AvailabilityRouter {
      */
     public void recordFailure(String agentType) {
         try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey() + ":" + agentType;
+            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
             jedis.incr(key);
             jedis.expire(key, CIRCUIT_BREAKER_WINDOW_SECONDS);
         }
@@ -236,8 +315,15 @@ public class AvailabilityRouter {
     // ---- Quota ----
 
     boolean isQuotaExceeded(String tenantId) {
+        // 1. Check control-plane JSON quota key
+        Map<String, Object> quota = readJsonKey(Constants.QueueNames.controlPlaneQuotaKey(tenantId));
+        if (quota != null) {
+            return Boolean.FALSE.equals(quota.get("available"));
+        }
+
+        // 2. Fallback: check SDK-local quota key
         try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneQuotaKey(tenantId);
+            String key = Constants.QueueNames.controlPlaneQuotaKey(tenantId) + ":local";
             String value = jedis.get(key);
             if (value == null) {
                 return false;
@@ -269,8 +355,27 @@ public class AvailabilityRouter {
      * @return A fallback agent type, or null if not configured
      */
     String resolveConfiguredFallback(String agentType) {
-        // Default implementation: no fallback configured
-        // Subclasses can override to provide fallback routing from config/Redis
+        Map<String, Object> fallback = readJsonKey(Constants.QueueNames.controlPlaneAgentFallback(agentType));
+        if (fallback == null) {
+            return null;
+        }
+
+        Object selectedObj = fallback.get("selected_agent_type");
+        if (selectedObj == null) {
+            selectedObj = fallback.get("agent_type");
+        }
+        if (selectedObj == null) {
+            selectedObj = fallback.get("target_agent_type");
+        }
+
+        String selected = selectedObj != null ? String.valueOf(selectedObj).trim() : "";
+        if (selected.isEmpty()) {
+            return null;
+        }
+
+        if (hasOnlineAgentType(selected)) {
+            return selected;
+        }
         return null;
     }
 
@@ -280,14 +385,28 @@ public class AvailabilityRouter {
         try (Jedis jedis = redisClient.getResource()) {
             String managementStream = Constants.QueueNames.controlPlaneManagementStream();
 
+            int priority = 0;
+            if (intent.getPriority() != null) {
+                try {
+                    priority = Integer.parseInt(intent.getPriority());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+
             WakeupRequest request = WakeupRequest.builder()
                     .executionId(intent.getExecutionId())
-                    .agentType(intent.getTargetAgentType())
-                    .reason("No online worker available")
-                    .priority(intent.getPriority() != null ? intent.getPriority() : "normal")
-                    .requestedAt(System.currentTimeMillis())
-                    .ttlMs(intent.getTimeoutMs())
+                    .targetAgentType(intent.getTargetAgentType())
+                    .sessionId(intent.getSessionId())
+                    .traceId(intent.getTraceId())
+                    .messageId(intent.getMessageId())
+                    .source(intent.getSource() != null ? intent.getSource() : "client")
+                    .policy(intent.getPolicy())
+                    .timeoutMs(intent.getTimeoutMs())
+                    .userCode(intent.getUserCode())
+                    .region(intent.getRegion())
+                    .priority(priority)
                     .metadata(intent.getMetadata())
+                    .commandPayload(intent.getCommandPayload())
                     .build();
 
             jedis.xadd(managementStream, (StreamEntryID) null, request.toRedisPayload());
@@ -297,11 +416,21 @@ public class AvailabilityRouter {
 
     /**
      * Block and wait for a wakeup decision using Redis xread with block.
-     * Since Jedis is synchronous (blocking), this uses Thread.sleep between polls.
+     * Mirrors Python's {@code _wait_for_wakeup_decision}.
+     *
+     * <ul>
+     *   <li>Starts from 0-0 to avoid missing decisions already written by the controller</li>
+     *   <li>Filters out STARTING / QUEUED intermediate states (continues waiting)</li>
+     *   <li>Returns null on timeout (matching Python's None return)</li>
+     * </ul>
      */
     WakeupDecision waitForWakeupDecision(DeliveryIntent intent) {
         long deadline = System.currentTimeMillis() + Math.max(intent.getTimeoutMs(), 100);
         String decisionStream = Constants.QueueNames.controlPlaneDecisionStream(intent.getExecutionId());
+
+        // Start from 0-0 (not $) to avoid a race condition: the WakeupController
+        // may have already written the decision before this xread call starts.
+        StreamEntryID lastId = new StreamEntryID("0-0");
 
         while (System.currentTimeMillis() < deadline) {
             try (Jedis jedis = redisClient.getResource()) {
@@ -313,7 +442,7 @@ public class AvailabilityRouter {
                 int blockMs = (int) Math.min(remaining, 2000);
 
                 XReadParams xReadParams = XReadParams.xReadParams().count(1).block(blockMs);
-                Map<String, StreamEntryID> streamMap = Map.of(decisionStream, StreamEntryID.LAST_ENTRY);
+                Map<String, StreamEntryID> streamMap = Map.of(decisionStream, lastId);
 
                 List<Map.Entry<String, List<StreamEntry>>> results =
                         jedis.xread(xReadParams, streamMap);
@@ -322,9 +451,22 @@ public class AvailabilityRouter {
                     for (Map.Entry<String, List<StreamEntry>> result : results) {
                         for (StreamEntry entry : result.getValue()) {
                             Map<String, String> fields = entry.getFields();
-                            // Clean up the stream entry
+                            // Advance past consumed entries
+                            lastId = entry.getID();
+                            // Clean up the consumed entry
                             jedis.xdel(decisionStream, entry.getID());
-                            return WakeupDecision.fromDict(fields);
+
+                            WakeupDecision decision = WakeupDecision.fromDict(fields);
+
+                            // Filter: skip intermediate states, keep waiting
+                            if (WakeupDecisionStatus.STARTING.equals(decision.getStatus())
+                                    || WakeupDecisionStatus.QUEUED.equals(decision.getStatus())) {
+                                log.debug("Received intermediate wakeup status={}, continuing to wait",
+                                        decision.getStatus());
+                                break; // break inner loop, continue outer while loop
+                            }
+
+                            return decision;
                         }
                     }
                 }
@@ -340,18 +482,21 @@ public class AvailabilityRouter {
         }
 
         log.warn("Timed out waiting for wakeup decision for execution_id={}", intent.getExecutionId());
-        return WakeupDecision.builder()
-                .executionId(intent.getExecutionId())
-                .status(WakeupDecisionStatus.TIMEOUT)
-                .reason("Timed out waiting for wakeup decision after " + intent.getTimeoutMs() + "ms")
-                .build();
+        return null;
     }
 
     // ---- Pending delivery queue ----
 
     void queuePendingDelivery(DeliveryIntent intent) {
         try (Jedis jedis = redisClient.getResource()) {
-            String pendingQueue = Constants.QueueNames.controlPlanePendingQueue(intent.getTargetAgentType());
+            String pendingQueue = Constants.QueueNames.controlPlanePendingQueue();
+
+            int priority = 0;
+            if (intent.getPriority() != null) {
+                try {
+                    priority = Integer.parseInt(intent.getPriority());
+                } catch (NumberFormatException ignored) {}
+            }
 
             PendingDelivery pending = PendingDelivery.builder()
                     .executionId(intent.getExecutionId())
@@ -360,9 +505,10 @@ public class AvailabilityRouter {
                     .traceId(intent.getTraceId())
                     .source(intent.getSource())
                     .targetAgentType(intent.getTargetAgentType())
+                    .deliveryStream(Constants.QueueNames.ctrlStream(intent.getTargetAgentType()))
                     .userCode(intent.getUserCode())
                     .region(intent.getRegion())
-                    .priority(intent.getPriority())
+                    .priority(priority)
                     .policy(intent.getPolicy())
                     .queuedAt(System.currentTimeMillis())
                     .timeoutMs(intent.getTimeoutMs())

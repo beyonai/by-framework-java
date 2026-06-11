@@ -5,6 +5,7 @@ import com.iwhaleai.byai.framework.common.RedisClient;
 import lombok.extern.slf4j.Slf4j;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.SetParams;
 import redis.clients.jedis.params.XReadParams;
 import redis.clients.jedis.resps.StreamEntry;
 
@@ -78,8 +79,9 @@ public class WakeupController {
             return;
         }
 
-        // Dedupe check
-        String dedupeKey = Constants.REDIS_PREFIX + "control_plane:wakeup_dedupe:" + request.getExecutionId();
+        // Dedupe check (aligned with Python: SET NX with TTL)
+        String dedupeKey = Constants.QueueNames.controlPlaneWakeupDedupe(
+                request.getTargetAgentType(), request.getUserCode(), request.getRegion());
         String dedupeVal = jedis.get(dedupeKey);
         int attempts = 0;
         if (dedupeVal != null) {
@@ -93,45 +95,53 @@ public class WakeupController {
             return;
         }
 
-        // Mark dedupe
-        jedis.setex(dedupeKey, dedupeTtlSeconds, String.valueOf(attempts + 1));
-
-        // Check TTL
-        if (request.getTtlMs() > 0) {
-            long age = System.currentTimeMillis() - request.getRequestedAt();
-            if (age > request.getTtlMs()) {
-                log.info("Wakeup request {} expired (age={}ms > ttl={}ms)", request.getExecutionId(), age, request.getTtlMs());
-                writeDecision(jedis, request.getExecutionId(),
-                        WakeupDecisionStatus.FAILED, "Request TTL expired", "");
-                return;
-            }
+        // Atomically claim the wakeup (SET NX with TTL, matching Python's SET EX NX)
+        String result = jedis.set(dedupeKey, request.getExecutionId(),
+                SetParams.setParams().nx().ex(dedupeTtlSeconds));
+        if (result == null) {
+            // Key already exists — wakeup already claimed
+            log.debug("Wakeup for execution_id={} already claimed, skipping", request.getExecutionId());
+            return;
         }
 
         // Delegate to provider
-        log.info("Processing wakeup for agent_type='{}' execution_id={}", request.getAgentType(), request.getExecutionId());
+        log.info("Processing wakeup for agent_type='{}' execution_id={}", request.getTargetAgentType(), request.getExecutionId());
         try {
             WakeupDecision decision = wakeupProvider.wakeup(request);
-            writeDecision(jedis, decision.getExecutionId(), decision.getStatus(),
-                    decision.getReason(), decision.getWorkerId());
+            writeDecision(jedis, decision, request);
         } catch (Exception e) {
             log.error("Wakeup provider failed for execution_id={}: {}", request.getExecutionId(), e.getMessage(), e);
-            writeDecision(jedis, request.getExecutionId(),
-                    WakeupDecisionStatus.FAILED, "Wakeup provider error: " + e.getMessage(), "");
+            WakeupDecision failedDecision = WakeupDecision.builder()
+                    .executionId(request.getExecutionId())
+                    .targetAgentType(request.getTargetAgentType())
+                    .status(WakeupDecisionStatus.FAILED)
+                    .reason("Wakeup provider error: " + e.getMessage())
+                    .workerId("")
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+            writeDecision(jedis, failedDecision, request);
         }
     }
 
-    private void writeDecision(Jedis jedis, String executionId, String status, String reason, String workerId) {
-        String decisionStream = Constants.QueueNames.controlPlaneDecisionStream(executionId);
-        WakeupDecision decision = WakeupDecision.builder()
-                .executionId(executionId)
-                .status(status)
-                .reason(reason != null ? reason : "")
-                .workerId(workerId != null ? workerId : "")
-                .timestamp(System.currentTimeMillis())
-                .build();
+    private void writeDecision(Jedis jedis, WakeupDecision decision, WakeupRequest request) {
+        WakeupDecision.WakeupDecisionBuilder builder = WakeupDecision.builder()
+                .executionId(decision.getExecutionId())
+                .status(decision.getStatus())
+                .reason(decision.getReason() != null ? decision.getReason() : "")
+                .workerId(decision.getWorkerId() != null ? decision.getWorkerId() : "")
+                .targetAgentType(decision.getTargetAgentType() != null && !decision.getTargetAgentType().isEmpty()
+                        ? decision.getTargetAgentType() : request.getTargetAgentType())
+                .selectedAgentType(decision.getSelectedAgentType())
+                .workerIds(decision.getWorkerIds())
+                .region(decision.getRegion() != null && !decision.getRegion().isEmpty()
+                        ? decision.getRegion() : request.getRegion())
+                .retryAfterMs(decision.getRetryAfterMs())
+                .timestamp(decision.getTimestamp() > 0 ? decision.getTimestamp() : System.currentTimeMillis());
 
-        Map<String, String> fieldMap = decision.toDict();
-        jedis.xadd(decisionStream, (StreamEntryID) null, new HashMap<>(fieldMap));
-        jedis.expire(decisionStream, 300); // 5-minute TTL for decision streams
+        WakeupDecision finalDecision = builder.build();
+        String decisionStreamKey = Constants.QueueNames.controlPlaneDecisionStream(finalDecision.getExecutionId());
+        Map<String, String> fieldMap = finalDecision.toDict();
+        jedis.xadd(decisionStreamKey, (StreamEntryID) null, new HashMap<>(fieldMap));
+        jedis.expire(decisionStreamKey, 300); // 5-minute TTL for decision streams
     }
 }

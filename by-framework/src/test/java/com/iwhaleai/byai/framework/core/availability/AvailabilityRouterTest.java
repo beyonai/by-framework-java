@@ -42,7 +42,7 @@ class AvailabilityRouterTest {
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
         // Default: circuit breaker and quota are not exceeded
-        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit_breaker:"))).thenReturn(null);
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit:"))).thenReturn(null);
         lenient().when(jedis.get(startsWith("byai_gateway:control_plane:quota:"))).thenReturn(null);
         router = new AvailabilityRouter(redisClient, workerRegistry, 30000, 5, 1000);
     }
@@ -111,22 +111,20 @@ class AvailabilityRouterTest {
 
     @Test
     void wakeAndWaitHappyPathShouldWaitAndDeliver() {
-        // No online workers initially
+        // No online workers initially, but online after recheck
         when(workerRegistry.hasOnlineAgentType(eq("agent-x"), eq(true), anyLong()))
-                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
+                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()))
+                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(true, List.of("worker-woke")));
 
         // XADD for wakeup emission
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
                 (StreamEntryID) isNull(), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
-        // XREAD returns a READY decision
+        // XREAD returns a READY decision (wrapped in "data" field, matching Python format)
         Map<String, String> decisionFields = new HashMap<>();
-        decisionFields.put("execution_id", "exec-123");
-        decisionFields.put("status", WakeupDecisionStatus.READY);
-        decisionFields.put("reason", "Worker woke up");
-        decisionFields.put("worker_id", "worker-woke");
-        decisionFields.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        String dataJson = "{\"execution_id\":\"exec-123\",\"status\":\"READY\",\"reason\":\"Worker woke up\",\"worker_id\":\"worker-woke\",\"timestamp\":\"" + System.currentTimeMillis() + "\"}";
+        decisionFields.put("data", dataJson);
 
         StreamEntry decisionEntry = new StreamEntry(
                 new StreamEntryID("1-0"), decisionFields);
@@ -169,7 +167,7 @@ class AvailabilityRouterTest {
         AvailabilityResult result = router.prepareDelivery(intent);
 
         assertEquals(AvailabilityStatus.REJECT, result.getStatus());
-        assertTrue(result.getReason().contains("TIMEOUT"));
+        assertTrue(result.getReason().contains("Timed out"));
     }
 
     @Test
@@ -180,7 +178,7 @@ class AvailabilityRouterTest {
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
                 (StreamEntryID) isNull(), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
-        when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue("agent-x")),
+        when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
                 (StreamEntryID) isNull(), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
@@ -193,7 +191,7 @@ class AvailabilityRouterTest {
         // Verify wakeup was emitted AND pending delivery was queued
         verify(jedis).xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
                 (StreamEntryID) isNull(), anyMap());
-        verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue("agent-x")),
+        verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
                 (StreamEntryID) isNull(), anyMap());
     }
 
@@ -202,7 +200,7 @@ class AvailabilityRouterTest {
         when(workerRegistry.hasOnlineAgentType(eq("agent-x"), eq(true), anyLong()))
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
 
-        when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue("agent-x")),
+        when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
                 (StreamEntryID) isNull(), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
@@ -212,7 +210,7 @@ class AvailabilityRouterTest {
         assertEquals(AvailabilityStatus.QUEUE_PENDING, result.getStatus());
 
         // Verify pending delivery was queued, but NO wakeup emitted
-        verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue("agent-x")),
+        verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
                 (StreamEntryID) isNull(), anyMap());
         verify(jedis, never()).xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
                 (StreamEntryID) isNull(), anyMap());
@@ -220,13 +218,13 @@ class AvailabilityRouterTest {
 
     @Test
     void circuitBreakerOpenShouldReject() {
-        // Circuit breaker: key returns threshold value
-        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey() + ":agent-x";
-        when(jedis.get(cbKey)).thenReturn("5"); // >= threshold
-
+        // Circuit breaker: key returns control-plane JSON state
+        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey("agent-x");
+        when(jedis.get(cbKey)).thenReturn("{\"state\":\"OPEN\",\"reason\":\"Circuit breaker open\"}");
+ 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.FAIL_FAST);
         AvailabilityResult result = router.prepareDelivery(intent);
-
+ 
         assertEquals(AvailabilityStatus.REJECT, result.getStatus());
         assertTrue(result.getReason().contains("Circuit breaker open"));
         assertEquals("ERR_AGENT_CIRCUIT_OPEN", result.getErrorCode());
@@ -234,13 +232,13 @@ class AvailabilityRouterTest {
 
     @Test
     void quotaExceededShouldReject() {
-        // Quota: key returns limit value
+        // Quota: key returns control-plane JSON limit
         String quotaKey = Constants.QueueNames.controlPlaneQuotaKey("user-1");
-        when(jedis.get(quotaKey)).thenReturn("1000"); // >= limit
-
+        when(jedis.get(quotaKey)).thenReturn("{\"available\":false,\"reason\":\"Quota exceeded\"}");
+ 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.FAIL_FAST);
         AvailabilityResult result = router.prepareDelivery(intent);
-
+ 
         assertEquals(AvailabilityStatus.REJECT, result.getStatus());
         assertTrue(result.getReason().contains("Quota exceeded"));
         assertEquals("ERR_TENANT_QUOTA_EXCEEDED", result.getErrorCode());
@@ -248,48 +246,46 @@ class AvailabilityRouterTest {
 
     @Test
     void circuitBreakerUnderThresholdShouldPass() {
-        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey() + ":agent-x";
-        when(jedis.get(cbKey)).thenReturn("3"); // < threshold
-
+        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey("agent-x");
+        when(jedis.get(cbKey)).thenReturn("{\"state\":\"CLOSED\"}");
+ 
         when(workerRegistry.hasOnlineAgentType(eq("agent-x"), eq(true), anyLong()))
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(true, List.of("worker-1")));
-
+ 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.FAIL_FAST);
         AvailabilityResult result = router.prepareDelivery(intent);
-
+ 
         assertEquals(AvailabilityStatus.DELIVER_NOW, result.getStatus());
     }
 
     @Test
     void quotaUnderLimitShouldPass() {
         String quotaKey = Constants.QueueNames.controlPlaneQuotaKey("user-1");
-        when(jedis.get(quotaKey)).thenReturn("500"); // < limit
-
+        when(jedis.get(quotaKey)).thenReturn("{\"available\":true}");
+ 
         when(workerRegistry.hasOnlineAgentType(eq("agent-x"), eq(true), anyLong()))
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(true, List.of("worker-1")));
-
+ 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.FAIL_FAST);
         AvailabilityResult result = router.prepareDelivery(intent);
-
+ 
         assertEquals(AvailabilityStatus.DELIVER_NOW, result.getStatus());
     }
 
     @Test
     void executionIdCorrelationInWakeup() {
         when(workerRegistry.hasOnlineAgentType(eq("agent-x"), eq(true), anyLong()))
-                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
+                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()))
+                .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(true, List.of("w-1")));
 
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
                 (StreamEntryID) isNull(), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
-        // XREAD returns a READY decision
+        // XREAD returns a READY decision (wrapped in "data" field, matching Python format)
         Map<String, String> decisionFields = new HashMap<>();
-        decisionFields.put("execution_id", "my-exec-id");
-        decisionFields.put("status", WakeupDecisionStatus.READY);
-        decisionFields.put("reason", "");
-        decisionFields.put("worker_id", "w-1");
-        decisionFields.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        String dataJson = "{\"execution_id\":\"my-exec-id\",\"status\":\"READY\",\"reason\":\"\",\"worker_id\":\"w-1\",\"timestamp\":\"" + System.currentTimeMillis() + "\"}";
+        decisionFields.put("data", dataJson);
 
         StreamEntry decisionEntry = new StreamEntry(new StreamEntryID("1-0"), decisionFields);
         List<Map.Entry<String, List<StreamEntry>>> xreadResult = List.of(
@@ -367,10 +363,10 @@ class AvailabilityRouterTest {
     void recordFailureIncrementsCircuitBreaker() {
         when(jedis.incr(anyString())).thenReturn(1L);
         when(jedis.expire(anyString(), anyLong())).thenReturn(1L);
-
+ 
         router.recordFailure("agent-x");
-
-        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey() + ":agent-x";
+ 
+        String cbKey = Constants.QueueNames.controlPlaneCircuitBreakerKey("agent-x") + ":local";
         verify(jedis).incr(cbKey);
         verify(jedis).expire(cbKey, 60L);
     }
@@ -379,12 +375,18 @@ class AvailabilityRouterTest {
     void wakeupRequestToRedisPayloadRoundTrip() {
         WakeupRequest request = WakeupRequest.builder()
                 .executionId("exec-1")
-                .agentType("agent-x")
-                .reason("test")
-                .priority("high")
-                .requestedAt(System.currentTimeMillis())
-                .ttlMs(30000)
+                .targetAgentType("agent-x")
+                .sessionId("sess-1")
+                .traceId("trace-1")
+                .messageId("msg-1")
+                .source("client")
+                .policy(RoutePolicy.WAKE_AND_QUEUE)
+                .timeoutMs(30000)
+                .userCode("user-1")
+                .region("")
+                .priority(5)
                 .metadata(Map.of("key", "value"))
+                .commandPayload(Map.of("action_type", "ASK_AGENT", "body", Map.of("content", "test")))
                 .build();
 
         Map<String, String> payload = request.toRedisPayload();
@@ -393,8 +395,11 @@ class AvailabilityRouterTest {
 
         WakeupRequest back = WakeupRequest.fromDict(payload);
         assertEquals("exec-1", back.getExecutionId());
-        assertEquals("agent-x", back.getAgentType());
-        assertEquals("high", back.getPriority());
+        assertEquals("agent-x", back.getTargetAgentType());
+        assertEquals(5, back.getPriority());
+        assertEquals("sess-1", back.getSessionId());
+        assertEquals("client", back.getSource());
+        assertNotNull(back.getCommandPayload());
     }
 
     @Test
@@ -406,21 +411,24 @@ class AvailabilityRouterTest {
                 .traceId("trace-1")
                 .source("caller")
                 .targetAgentType("agent-x")
+                .deliveryStream("byai_gateway:ctrl:agent_type:agent-x")
                 .userCode("user-1")
-                .priority("high")
+                .priority(5)
                 .policy(RoutePolicy.WAKE_AND_QUEUE)
                 .queuedAt(System.currentTimeMillis())
                 .timeoutMs(30000)
                 .commandPayload(Map.of("cmd", "data"))
                 .metadata(Map.of("m", "v"))
                 .build();
-
+ 
         Map<String, String> payload = pending.toRedisPayload();
         assertNotNull(payload);
-
+ 
         PendingDelivery back = PendingDelivery.fromDict(payload);
         assertEquals("exec-1", back.getExecutionId());
         assertEquals("agent-x", back.getTargetAgentType());
+        assertEquals(5, back.getPriority());
+        assertEquals("byai_gateway:ctrl:agent_type:agent-x", back.getDeliveryStream());
         assertEquals(RoutePolicy.WAKE_AND_QUEUE, back.getPolicy());
     }
 

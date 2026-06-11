@@ -92,25 +92,54 @@ public static final int MAX_RETRY_COUNT = 3;
         }
 
         // -- Control Plane (Agent Availability) --
+        // Keys are aligned with Python's RedisKeys for cross-SDK compatibility.
+        // Python ref: by_framework/common/constants.py
 
+        /** Management stream for agent availability wakeup requests. */
         public static String controlPlaneManagementStream() {
-            return REDIS_PREFIX + "control_plane:management_stream";
+            return REDIS_PREFIX + "control_plane:mgmt:wakeup";
         }
 
+        /** Per-execution result stream for wakeup controller decisions. */
         public static String controlPlaneDecisionStream(String executionId) {
-            return REDIS_PREFIX + "control_plane:decision:" + executionId;
+            return REDIS_PREFIX + "control_plane:mgmt:wakeup:result:" + executionId;
         }
 
-        public static String controlPlanePendingQueue(String agentType) {
-            return REDIS_PREFIX + "control_plane:pending:" + agentType;
+        /** Pending delivery queue (single global stream, not per-agent-type). */
+        public static String controlPlanePendingQueue() {
+            return REDIS_PREFIX + "control_plane:mgmt:delivery:pending";
         }
 
-        public static String controlPlaneCircuitBreakerKey() {
-            return REDIS_PREFIX + "control_plane:circuit_breaker";
+        /** Dead letter stream for failed control-plane work. */
+        public static String controlPlaneDeadletterStream() {
+            return REDIS_PREFIX + "control_plane:mgmt:deadletter";
         }
 
-        public static String controlPlaneQuotaKey(String tenantId) {
-            return REDIS_PREFIX + "control_plane:quota:" + tenantId;
+        /** Circuit-breaker state key for an agent type. */
+        public static String controlPlaneCircuitBreakerKey(String agentType) {
+            return REDIS_PREFIX + "control_plane:circuit:agent_type:" + agentType;
+        }
+
+        /** User/tenant quota state key. */
+        public static String controlPlaneQuotaKey(String userCode) {
+            return REDIS_PREFIX + "control_plane:quota:user:" + userCode;
+        }
+
+        /** Availability state key for an agent type. */
+        public static String controlPlaneAgentAvailability(String agentType) {
+            return REDIS_PREFIX + "control_plane:availability:agent_type:" + agentType;
+        }
+
+        /** Fallback routing state key for an agent type. */
+        public static String controlPlaneAgentFallback(String agentType) {
+            return REDIS_PREFIX + "control_plane:fallback:agent_type:" + agentType;
+        }
+
+        /** Deduplication key for concurrent wakeup requests. */
+        public static String controlPlaneWakeupDedupe(String agentType, String userCode, String region) {
+            return REDIS_PREFIX + "control_plane:wakeup:dedupe:"
+                    + agentType + ":" + (userCode != null ? userCode : "") + ":"
+                    + (region != null ? region : "");
         }
     }
 

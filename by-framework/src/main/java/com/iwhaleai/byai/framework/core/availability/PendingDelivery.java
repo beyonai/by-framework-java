@@ -24,9 +24,10 @@ public class PendingDelivery {
     private String traceId;
     private String source;
     private String targetAgentType;
+    private String deliveryStream;
     private String userCode;
     private String region;
-    private String priority;
+    private int priority;
     private String policy;
     private long queuedAt;
     private long timeoutMs;
@@ -45,14 +46,15 @@ public class PendingDelivery {
             fields.put("trace_id", traceId);
             fields.put("source", source != null ? source : "");
             fields.put("target_agent_type", targetAgentType);
+            fields.put("delivery_stream", deliveryStream != null ? deliveryStream : "");
             fields.put("user_code", userCode != null ? userCode : "");
             fields.put("region", region != null ? region : "");
-            fields.put("priority", priority != null ? priority : "");
+            fields.put("priority", priority);
             fields.put("policy", policy != null ? policy : RoutePolicy.FAIL_FAST);
             fields.put("queued_at", String.valueOf(queuedAt));
             fields.put("timeout_ms", String.valueOf(timeoutMs));
-            fields.put("command_payload", OBJECT_MAPPER.writeValueAsString(commandPayload != null ? commandPayload : new HashMap<>()));
-            fields.put("metadata", OBJECT_MAPPER.writeValueAsString(metadata != null ? metadata : new HashMap<>()));
+            fields.put("command_payload", commandPayload != null ? commandPayload : new HashMap<>());
+            fields.put("metadata", metadata != null ? metadata : new HashMap<>());
 
             Map<String, String> payload = new HashMap<>();
             payload.put("data", OBJECT_MAPPER.writeValueAsString(fields));
@@ -73,11 +75,23 @@ public class PendingDelivery {
                 return null;
             }
             Map<String, Object> fields = OBJECT_MAPPER.readValue(dataJson, Map.class);
+            // Handle priority: may be int or string
+            int priority = 0;
+            Object priVal = fields.get("priority");
+            if (priVal instanceof Number) {
+                priority = ((Number) priVal).intValue();
+            } else if (priVal instanceof String && !((String) priVal).isEmpty()) {
+                try {
+                    priority = Integer.parseInt((String) priVal);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+
             Map<String, Object> commandPayload;
             Object cpVal = fields.get("command_payload");
             if (cpVal instanceof Map) {
                 commandPayload = (Map<String, Object>) cpVal;
-            } else if (cpVal instanceof String) {
+            } else if (cpVal instanceof String && !((String) cpVal).isEmpty()) {
                 commandPayload = OBJECT_MAPPER.readValue((String) cpVal, Map.class);
             } else {
                 commandPayload = new HashMap<>();
@@ -87,7 +101,7 @@ public class PendingDelivery {
             Object metaVal = fields.get("metadata");
             if (metaVal instanceof Map) {
                 metadata = (Map<String, Object>) metaVal;
-            } else if (metaVal instanceof String) {
+            } else if (metaVal instanceof String && !((String) metaVal).isEmpty()) {
                 metadata = OBJECT_MAPPER.readValue((String) metaVal, Map.class);
             } else {
                 metadata = new HashMap<>();
@@ -100,9 +114,10 @@ public class PendingDelivery {
                     .traceId(String.valueOf(fields.getOrDefault("trace_id", "")))
                     .source(String.valueOf(fields.getOrDefault("source", "")))
                     .targetAgentType(String.valueOf(fields.getOrDefault("target_agent_type", "")))
+                    .deliveryStream(String.valueOf(fields.getOrDefault("delivery_stream", "")))
                     .userCode(String.valueOf(fields.getOrDefault("user_code", "")))
                     .region(String.valueOf(fields.getOrDefault("region", "")))
-                    .priority(String.valueOf(fields.getOrDefault("priority", "")))
+                    .priority(priority)
                     .policy(String.valueOf(fields.getOrDefault("policy", RoutePolicy.FAIL_FAST)))
                     .queuedAt(Long.parseLong(String.valueOf(fields.getOrDefault("queued_at", "0"))))
                     .timeoutMs(Long.parseLong(String.valueOf(fields.getOrDefault("timeout_ms", "0"))))

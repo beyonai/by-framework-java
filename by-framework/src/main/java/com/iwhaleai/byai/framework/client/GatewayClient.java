@@ -424,6 +424,32 @@ public class GatewayClient<T> {
     }
 
     /**
+     * Backward-compatible sendMessage method using boolean requireOnlineWorker.
+     * Maps requireOnlineWorker to RoutePolicy:
+     * - true -> FAIL_FAST
+     * - false -> SEND_ANYWAY
+     */
+    public synchronized SendResponse sendMessage(
+            String targetAgentType,
+            String sessionId,
+            T content,
+            String userCode,
+            String userName,
+            String actionType,
+            String parentMessageId,
+            String messageId,
+            String traceId,
+            Map<String, Object> payload,
+            Map<String, Object> metadata,
+            String targetWorkerId,
+            boolean requireOnlineWorker) {
+        String routePolicy = requireOnlineWorker ? RoutePolicy.FAIL_FAST : RoutePolicy.SEND_ANYWAY;
+        return sendMessage(targetAgentType, sessionId, content, userCode, userName, actionType, parentMessageId,
+                messageId, traceId, payload, metadata, targetWorkerId, routePolicy, 0L, null, null);
+    }
+
+
+    /**
      * Send a message to the gateway with full control over routing and availability.
      *
      * @param targetAgentType      Target agent type for routing
@@ -492,13 +518,35 @@ public class GatewayClient<T> {
         String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
 
         try {
+            // Build command payload for wakeup / pending delivery (before routing decision)
+            Map<String, Object> headerMap = new HashMap<>();
+            headerMap.put("message_id", messageId);
+            headerMap.put("session_id", params.getSessionId());
+            headerMap.put("trace_id", traceId);
+            headerMap.put("source_agent_type", "");
+            headerMap.put("target_agent_type", params.getTargetAgentType());
+            headerMap.put("parent_message_id", params.getParentMessageId());
+            headerMap.put("task_group_id", "");
+            headerMap.put("user_code", params.getUserCode());
+            headerMap.put("user_name", params.getUserName());
+            headerMap.put("metadata", params.getMetadata());
+
+            Map<String, Object> bodyMap = new HashMap<>();
+            bodyMap.put("content", params.getContent());
+            bodyMap.put("wait_for_reply", Boolean.TRUE.equals(params.getPayload().get("wait_for_reply")));
+
+            Map<String, Object> commandPayload = new HashMap<>();
+            commandPayload.put("action_type", params.getActionType());
+            commandPayload.put("header", headerMap);
+            commandPayload.put("body", bodyMap);
+
             // Build delivery intent for availability routing
             DeliveryIntent intent = DeliveryIntent.builder()
                     .executionId(executionId)
                     .messageId(messageId)
                     .sessionId(params.getSessionId())
                     .traceId(traceId)
-                    .source("")
+                    .source("client")
                     .targetAgentType(params.getTargetAgentType())
                     .userCode(params.getUserCode())
                     .region(region)
@@ -506,6 +554,7 @@ public class GatewayClient<T> {
                     .policy(resolvedPolicy)
                     .timeoutMs(availabilityTimeoutMs)
                     .metadata(params.getMetadata())
+                    .commandPayload(commandPayload)
                     .build();
 
             AvailabilityResult availResult = availabilityRouter.prepareDelivery(intent);

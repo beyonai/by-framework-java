@@ -41,7 +41,7 @@ class AgentContextTest {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
         lenient().when(jedis.pipelined()).thenReturn(pipeline);
         // AvailabilityRouter checks circuit breaker and quota before online check
-        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit_breaker:"))).thenReturn(null);
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit:"))).thenReturn(null);
         lenient().when(jedis.get(startsWith("byai_gateway:control_plane:quota:"))).thenReturn(null);
 
         context = new AgentContext(
