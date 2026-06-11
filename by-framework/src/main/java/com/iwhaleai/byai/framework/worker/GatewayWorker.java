@@ -140,39 +140,9 @@ public abstract class GatewayWorker {
             pluginRegistry.onTaskStart(context);
 
             if (isResume) {
-                String taskGroupId = header.taskGroupId();
-                if (taskGroupId != null && !taskGroupId.isBlank()) {
-                    try (Jedis jedis = redisClient.getResource()) {
-                        String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
-                        String totalStr = jedis.hget(groupKey, "total");
-                        if (totalStr != null) {
-                            if (command instanceof ResumeCommand resumeCommand) {
-                                String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
-                                Map<String, Object> resultData = new HashMap<>();
-                                resultData.put("status", resumeCommand.status());
-                                resultData.put("reply_data", resumeCommand.replyData());
-                                resultData.put("content", resumeCommand.content());
-                                resultData.put("metadata", resumeCommand.header().metadata());
-                                resultData.put("extra_payload", resumeCommand.extraPayload());
-                                jedis.hset(
-                                        resultsKey,
-                                        header.messageId(),
-                                        objectMapper.writeValueAsString(resultData)
-                                );
-                                jedis.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
-                            }
-                            long completed = jedis.hincrBy(groupKey, "completed", 1);
-                            int total = Integer.parseInt(totalStr);
-                            if (completed < total) {
-                                LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
-                                context.emitState(AgentState.QUEUED + ": waiting_for_group");
-                                return;
-                            }
-                            LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
-                        }
-                    }
+                if (!handleTaskGroupResume(command, header, context)) {
+                    return;
                 }
-                context.emitState(AgentState.RESUMED);
             }
 
             Object result = processCommand(command, context);
@@ -188,30 +158,7 @@ public abstract class GatewayWorker {
                 context.emitState(AgentState.COMPLETED);
             }
 
-            // Extract final message and emit FINAL_ANSWER
-            String finalMessage = null;
-            Object content = taskResult.content();
-            if (content instanceof String s && !s.isEmpty()) {
-                finalMessage = s;
-            } else if (content instanceof List<?> l && !l.isEmpty()) {
-                try {
-                    finalMessage = objectMapper.writeValueAsString(l);
-                } catch (Exception e) {
-                    LOG.warn("Failed to serialize content for FINAL_ANSWER", e);
-                }
-            } else if (taskResult.replyData() instanceof String replyStr && !replyStr.isEmpty()) {
-                finalMessage = replyStr;
-            } else if (taskResult.replyData() != null) {
-                try {
-                    finalMessage = objectMapper.writeValueAsString(taskResult.replyData());
-                } catch (Exception e) {
-                    LOG.warn("Failed to serialize reply_data for FINAL_ANSWER", e);
-                }
-            }
-
-            if (finalMessage != null) {
-                context.emitChunk(finalMessage, EventType.FINAL_ANSWER.getValue());
-            }
+            emitFinalAnswer(context, taskResult);
 
             // Emit APP_STREAM_RESPONSE if conditions are met
             boolean shouldEmitStreamEnd = !hasSourceAgent && AgentState.isTerminalState(finalStatus) && !permissionTransferred;
@@ -292,6 +239,68 @@ public abstract class GatewayWorker {
         }
     }
 
+    private boolean handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
+        String taskGroupId = header.taskGroupId();
+        if (taskGroupId != null && !taskGroupId.isBlank()) {
+            try (Jedis jedis = redisClient.getResource()) {
+                String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
+                String totalStr = jedis.hget(groupKey, "total");
+                if (totalStr != null) {
+                    if (command instanceof ResumeCommand resumeCommand) {
+                        String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
+                        Map<String, Object> resultData = new HashMap<>();
+                        resultData.put("status", resumeCommand.status());
+                        resultData.put("reply_data", resumeCommand.replyData());
+                        resultData.put("content", resumeCommand.content());
+                        resultData.put("metadata", resumeCommand.header().metadata());
+                        resultData.put("extra_payload", resumeCommand.extraPayload());
+                        jedis.hset(
+                                resultsKey,
+                                header.messageId(),
+                                objectMapper.writeValueAsString(resultData)
+                        );
+                        jedis.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
+                    }
+                    long completed = jedis.hincrBy(groupKey, "completed", 1);
+                    int total = Integer.parseInt(totalStr);
+                    if (completed < total) {
+                        LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
+                        context.emitState(AgentState.QUEUED + ": waiting_for_group");
+                        return false;
+                    }
+                    LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
+                }
+            }
+        }
+        context.emitState(AgentState.RESUMED);
+        return true;
+    }
+
+    private void emitFinalAnswer(AgentContext context, AgentTaskResult taskResult) {
+        String finalMessage = null;
+        Object content = taskResult.content();
+        if (content instanceof String s && !s.isEmpty()) {
+            finalMessage = s;
+        } else if (content instanceof List<?> l && !l.isEmpty()) {
+            try {
+                finalMessage = objectMapper.writeValueAsString(l);
+            } catch (Exception e) {
+                LOG.warn("Failed to serialize content for FINAL_ANSWER", e);
+            }
+        } else if (taskResult.replyData() instanceof String replyStr && !replyStr.isEmpty()) {
+            finalMessage = replyStr;
+        } else if (taskResult.replyData() != null) {
+            try {
+                finalMessage = objectMapper.writeValueAsString(taskResult.replyData());
+            } catch (Exception e) {
+                LOG.warn("Failed to serialize reply_data for FINAL_ANSWER", e);
+            }
+        }
+
+        if (finalMessage != null) {
+            context.emitChunk(finalMessage, EventType.FINAL_ANSWER.getValue());
+        }
+    }
 
     private void enqueueAgentReturn(GatewayCommand command, String status, Object replyData) {
         enqueueAgentReturn(command, new AgentTaskResult(status, "", replyData, Map.of(), Map.of()));
