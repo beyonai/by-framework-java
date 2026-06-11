@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LangfuseClientDispatchTracerTest {
@@ -72,6 +73,77 @@ class LangfuseClientDispatchTracerTest {
         assertTrue(httpClient.bodies.get(0).contains("\"id\":\"060f92f2a4dc5da4\""));
         assertTrue(httpClient.bodies.get(1).contains("\"type\":\"span-update\""));
         assertTrue(httpClient.bodies.get(1).contains("\"success\":true"));
+    }
+
+    @Test
+    void startReturnsNullWhenByaiLangfuseEnabledIsFalseLike() {
+        for (String disabledValue : List.of("0", "false", "no", "off", "disabled")) {
+            RecordingHttpClient httpClient = new RecordingHttpClient();
+            LangfuseClientDispatchTracer tracer = new LangfuseClientDispatchTracer(
+                    Map.of(
+                            "LANGFUSE_PUBLIC_KEY", "pk-test",
+                            "LANGFUSE_SECRET_KEY", "sk-test",
+                            "LANGFUSE_BASE_URL", "http://langfuse.local",
+                            "BYAI_LANGFUSE_ENABLED", disabledValue
+                    ),
+                    httpClient,
+                    new com.fasterxml.jackson.databind.ObjectMapper());
+
+            assertNull(tracer.start(request()));
+            assertTrue(httpClient.requests.isEmpty());
+        }
+    }
+
+    @Test
+    void startRequiresLangfuseBaseUrlLikePythonClient() {
+        RecordingHttpClient httpClient = new RecordingHttpClient();
+        LangfuseClientDispatchTracer tracer = new LangfuseClientDispatchTracer(
+                Map.of(
+                        "LANGFUSE_PUBLIC_KEY", "pk-test",
+                        "LANGFUSE_SECRET_KEY", "sk-test",
+                        "LANGFUSE_HOST", "http://langfuse.local",
+                        "LANGFUSE_INGESTION_URL", "http://langfuse.local/custom"
+                ),
+                httpClient,
+                new com.fasterxml.jackson.databind.ObjectMapper());
+
+        assertNull(tracer.start(request()));
+        assertTrue(httpClient.requests.isEmpty());
+    }
+
+    @Test
+    void startIgnoresLegacyJavaLangfuseEnabledFlags() {
+        RecordingHttpClient httpClient = new RecordingHttpClient();
+        LangfuseClientDispatchTracer tracer = new LangfuseClientDispatchTracer(
+                Map.of(
+                        "LANGFUSE_PUBLIC_KEY", "pk-test",
+                        "LANGFUSE_SECRET_KEY", "sk-test",
+                        "LANGFUSE_BASE_URL", "http://langfuse.local/",
+                        "BY_FRAMEWORK_LANGFUSE_ENABLED", "false",
+                        "LANGFUSE_ENABLED", "false"
+                ),
+                httpClient,
+                new com.fasterxml.jackson.databind.ObjectMapper());
+
+        ClientDispatchObservation observation = tracer.start(request());
+
+        assertNotNull(observation);
+        assertEquals(1, httpClient.requests.size());
+        assertEquals(URI.create("http://langfuse.local/api/public/ingestion"),
+                httpClient.requests.get(0).uri());
+    }
+
+    private static ClientDispatchTracer.ClientDispatchRequest request() {
+        return new ClientDispatchTracer.ClientDispatchRequest(
+                "trace-client",
+                "msg-client",
+                "demo-agent",
+                "sess-1",
+                "user-1",
+                "User One",
+                "hello",
+                Map.of("request_id", "req-1"),
+                "060f92f2a4dc5da4");
     }
 
     private static class RecordingHttpClient extends HttpClient {

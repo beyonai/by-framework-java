@@ -21,7 +21,8 @@ import java.util.UUID;
  */
 @Slf4j
 public class LangfuseClientDispatchTracer implements ClientDispatchTracer {
-    private static final String DEFAULT_BASE_URL = "https://cloud.langfuse.com";
+    private static final String INGESTION_PATH = "/api/public/ingestion";
+    private static final String QUOTES_TO_STRIP = "\"'“”‘’";
 
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
@@ -46,21 +47,13 @@ public class LangfuseClientDispatchTracer implements ClientDispatchTracer {
         this.httpClient = httpClient;
         this.publicKey = clean(environment.get("LANGFUSE_PUBLIC_KEY"));
         this.secretKey = clean(environment.get("LANGFUSE_SECRET_KEY"));
-        this.baseUrl = normalizeBaseUrl(firstNonBlank(
-                clean(environment.get("LANGFUSE_BASE_URL")),
-                clean(environment.get("LANGFUSE_HOST")),
-                DEFAULT_BASE_URL));
-        this.ingestionUrl = firstNonBlank(
-                clean(environment.get("LANGFUSE_INGESTION_URL")),
-                clean(environment.get("BY_FRAMEWORK_LANGFUSE_INGESTION_URL")),
-                baseUrl + "/api/public/ingestion");
-        String enabledValue = firstNonBlank(
-                clean(environment.get("BY_FRAMEWORK_LANGFUSE_ENABLED")),
-                clean(environment.get("LANGFUSE_ENABLED")),
-                "true");
-        this.enabled = !"false".equalsIgnoreCase(enabledValue)
+        this.baseUrl = normalizeBaseUrl(clean(environment.get("LANGFUSE_BASE_URL")));
+        this.ingestionUrl = baseUrl.isBlank() ? "" : baseUrl + INGESTION_PATH;
+        String enabledValue = clean(environment.get("BYAI_LANGFUSE_ENABLED"));
+        this.enabled = !isFalseLike(enabledValue)
                 && !publicKey.isBlank()
-                && !secretKey.isBlank();
+                && !secretKey.isBlank()
+                && !baseUrl.isBlank();
     }
 
     @Override
@@ -79,7 +72,9 @@ public class LangfuseClientDispatchTracer implements ClientDispatchTracer {
         metadata.put("target_agent_type", request.targetAgentType());
         metadata.put("user_code", request.userCode());
         metadata.put("user_name", request.userName());
-        metadata.put("header_metadata", request.metadata() != null ? request.metadata() : Map.of());
+        metadata.put(
+                "header_metadata",
+                request.metadata() != null ? request.metadata() : Map.of());
 
         Map<String, Object> traceBody = new HashMap<>();
         traceBody.put("id", traceIdHex);
@@ -144,8 +139,10 @@ public class LangfuseClientDispatchTracer implements ClientDispatchTracer {
     }
 
     private static String normalizeBaseUrl(String value) {
-        String normalized = value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
-        return normalized.isBlank() ? DEFAULT_BASE_URL : normalized;
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
     }
 
     private static String clean(String value) {
@@ -153,22 +150,23 @@ public class LangfuseClientDispatchTracer implements ClientDispatchTracer {
             return "";
         }
         String trimmed = value.trim();
-        if (trimmed.length() >= 2
-                && ((trimmed.startsWith("\"") && trimmed.endsWith("\""))
-                || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
-            return trimmed.substring(1, trimmed.length() - 1);
+        while (!trimmed.isEmpty() && QUOTES_TO_STRIP.indexOf(trimmed.charAt(0)) >= 0) {
+            trimmed = trimmed.substring(1);
+        }
+        while (!trimmed.isEmpty()
+                && QUOTES_TO_STRIP.indexOf(trimmed.charAt(trimmed.length() - 1)) >= 0) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
         }
         return trimmed;
     }
 
-    private static String firstNonBlank(String first, String second, String fallback) {
-        if (first != null && !first.isBlank()) {
-            return first;
-        }
-        if (second != null && !second.isBlank()) {
-            return second;
-        }
-        return fallback;
+    private static boolean isFalseLike(String value) {
+        String normalized = value.toLowerCase();
+        return "0".equals(normalized)
+                || "false".equals(normalized)
+                || "no".equals(normalized)
+                || "off".equals(normalized)
+                || "disabled".equals(normalized);
     }
 
     private final class LangfuseObservation implements ClientDispatchObservation {

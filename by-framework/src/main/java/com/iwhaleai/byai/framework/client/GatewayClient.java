@@ -42,6 +42,7 @@ public class GatewayClient<T> {
     private final List<GatewayInterceptor> interceptors;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final ClientDispatchTracer clientDispatchTracer;
+    private final RedisTraceWriter redisTraceWriter;
 
     public GatewayClient(RedisClient redisClient) {
         this(redisClient, new WorkerRegistry(redisClient), new ArrayList<>());
@@ -64,6 +65,7 @@ public class GatewayClient<T> {
         this.registry = registry;
         this.interceptors = interceptors != null ? interceptors : new ArrayList<>();
         this.clientDispatchTracer = clientDispatchTracer;
+        this.redisTraceWriter = new RedisTraceWriter(redisClient, objectMapper);
     }
 
     public GatewayClient(String host, int port) {
@@ -595,9 +597,22 @@ public class GatewayClient<T> {
                 log.warn("Failed to initialize execution tracking: {}", e.getMessage());
             }
 
+            long dispatchStartedAt = System.currentTimeMillis();
             SendResponse response = sendCommand((GatewayCommand) command, null, targetWorkerId, requireOnlineWorker);
+            long dispatchEndedAt = System.currentTimeMillis();
             if (response.isSuccess()) {
                 log.info("Message sent to gateway: {} (target={})", messageId, params.getTargetAgentType());
+                redisTraceWriter.recordClientDispatch(new RedisTraceWriter.ClientDispatchRecord(
+                        traceId,
+                        messageId,
+                        params.getSessionId(),
+                        params.getParentMessageId(),
+                        params.getTargetAgentType(),
+                        resolveTraceWorkerId(response),
+                        targetWorkerId != null && !targetWorkerId.isBlank() ? "DIRECT_WORKER" : "AGENT_TYPE",
+                        response.getStatus() != null ? response.getStatus() : "",
+                        dispatchStartedAt,
+                        dispatchEndedAt));
             }
             endClientDispatchObservation(
                     clientDispatchObservation,
@@ -644,6 +659,14 @@ public class GatewayClient<T> {
 
     private static String stringValue(Object value) {
         return value != null ? String.valueOf(value) : "";
+    }
+
+    private String resolveTraceWorkerId(SendResponse response) {
+        String responseWorkerId = response.getTargetWorkerId() != null ? response.getTargetWorkerId() : "";
+        if (!responseWorkerId.isBlank()) {
+            return responseWorkerId;
+        }
+        return "";
     }
 
     private static String resolveExecutionTraceId(Map<String, Object> execution) {
