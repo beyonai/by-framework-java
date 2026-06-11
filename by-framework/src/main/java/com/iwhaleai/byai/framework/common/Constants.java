@@ -4,6 +4,7 @@ public class Constants {
     public static final String REDIS_PREFIX = "byai_gateway:";
     public static final String SEPARATOR = ":";
     public static final int DEFAULT_SESSION_TTL = 7 * 24 * 3600;
+    public static final int TRACE_TTL_SECONDS = 15 * 60;
     public static final java.util.Set<String> TERMINAL_STATES = java.util.Set.of("COMPLETED", "FAILED", "CANCELLED", "SUCCESS");
 
     // Redis Stream field keys
@@ -153,6 +154,28 @@ public static final int MAX_RETRY_COUNT = 3;
 
         public static String sdInstanceDetails(String serviceName) {
             return REDIS_PREFIX + String.format("sd:instances:%s", serviceName);
+        }
+    }
+
+    public static class TraceKeys {
+        public static String traceMeta(String traceId) {
+            return "by_framework:trace:" + traceId;
+        }
+
+        public static String traceSpans(String traceId) {
+            return "by_framework:trace:spans:" + traceId;
+        }
+
+        public static String traceIndexSession(String sessionId) {
+            return "by_framework:trace:idx:session:" + sessionId;
+        }
+
+        public static String traceIndexWorker(String workerId) {
+            return "by_framework:trace:idx:worker:" + workerId;
+        }
+
+        public static String traceIndexAgent(String agentType) {
+            return "by_framework:trace:idx:agent:" + agentType;
         }
     }
 

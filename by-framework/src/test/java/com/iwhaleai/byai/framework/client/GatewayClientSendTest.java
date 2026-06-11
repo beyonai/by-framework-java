@@ -244,6 +244,65 @@ class GatewayClientSendTest {
     }
 
     @Test
+    void sendMessageRecordsRedisClientDispatchTraceSpan() throws Exception {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, null, "msg-client", "trace-client", null, null);
+
+        assertTrue(response.isSuccess());
+
+        @SuppressWarnings("rawtypes")
+        ArgumentCaptor<Map> metaCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis, atLeastOnce()).hset(eq("by_framework:trace:trace-client"), metaCaptor.capture());
+        Map<Object, Object> mergedMeta = new HashMap<>();
+        for (Map<?, ?> captured : metaCaptor.getAllValues()) {
+            mergedMeta.putAll(captured);
+        }
+        assertEquals("trace-client", mergedMeta.get("trace_id"));
+        assertEquals("sess-1", mergedMeta.get("session_id"));
+        assertEquals("COMPLETED", mergedMeta.get("status"));
+        assertEquals("client.dispatch:demo-agent", mergedMeta.get("name"));
+        assertEquals("demo-agent", mergedMeta.get("root_agent_type"));
+        assertEquals("msg-client", mergedMeta.get("root_message_id"));
+
+        ArgumentCaptor<String> spanCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jedis).rpush(eq("by_framework:trace:spans:trace-client"), spanCaptor.capture());
+        Map<?, ?> span = objectMapper.readValue(spanCaptor.getValue(), Map.class);
+        assertEquals("trace-client", span.get("trace_id"));
+        assertEquals("msg-client:client.dispatch", span.get("span_id"));
+        assertEquals("client.dispatch", span.get("operation"));
+        assertEquals("client", span.get("component"));
+        assertEquals("COMPLETED", span.get("status"));
+        assertEquals("sess-1", span.get("session_id"));
+        assertEquals("msg-client", span.get("message_id"));
+        assertEquals("client", span.get("source_agent_type"));
+        assertEquals("demo-agent", span.get("target_agent_type"));
+        assertEquals("", span.get("worker_id"));
+        assertEquals("AGENT_TYPE", span.get("route_policy"));
+        assertEquals("redis", span.get("source"));
+
+        verify(jedis).zadd(eq("by_framework:trace:idx:session:sess-1"), anyDouble(), eq("trace-client"));
+        verify(jedis, never()).zadd(eq("by_framework:trace:idx:worker:"), anyDouble(), eq("trace-client"));
+        verify(jedis).zadd(eq("by_framework:trace:idx:agent:demo-agent"), anyDouble(), eq("trace-client"));
+    }
+
+    @Test
+    void sendMessageIgnoresRedisTraceWriteFailures() {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+        doThrow(new RuntimeException("redis trace down")).when(jedis).hset(eq("by_framework:trace:trace-client"), any(Map.class));
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, null, "msg-client", "trace-client", null, null);
+
+        assertTrue(response.isSuccess());
+    }
+
+    @Test
     void sendMessageWithResumeActionType() throws Exception {
         FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
         GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
