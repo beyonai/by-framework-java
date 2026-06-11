@@ -495,7 +495,7 @@ public class AvailabilityRouter {
             if (intent.getPriority() != null) {
                 try {
                     priority = Integer.parseInt(intent.getPriority());
-                } catch (NumberFormatException ignored) {}
+                } catch (NumberFormatException ignored) { }
             }
 
             PendingDelivery pending = PendingDelivery.builder()

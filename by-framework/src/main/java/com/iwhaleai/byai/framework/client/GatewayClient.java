@@ -518,44 +518,10 @@ public class GatewayClient<T> {
         String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
 
         try {
-            // Build command payload for wakeup / pending delivery (before routing decision)
-            Map<String, Object> headerMap = new HashMap<>();
-            headerMap.put("message_id", messageId);
-            headerMap.put("session_id", params.getSessionId());
-            headerMap.put("trace_id", traceId);
-            headerMap.put("source_agent_type", "");
-            headerMap.put("target_agent_type", params.getTargetAgentType());
-            headerMap.put("parent_message_id", params.getParentMessageId());
-            headerMap.put("task_group_id", "");
-            headerMap.put("user_code", params.getUserCode());
-            headerMap.put("user_name", params.getUserName());
-            headerMap.put("metadata", params.getMetadata());
-
-            Map<String, Object> bodyMap = new HashMap<>();
-            bodyMap.put("content", params.getContent());
-            bodyMap.put("wait_for_reply", Boolean.TRUE.equals(params.getPayload().get("wait_for_reply")));
-
-            Map<String, Object> commandPayload = new HashMap<>();
-            commandPayload.put("action_type", params.getActionType());
-            commandPayload.put("header", headerMap);
-            commandPayload.put("body", bodyMap);
-
-            // Build delivery intent for availability routing
-            DeliveryIntent intent = DeliveryIntent.builder()
-                    .executionId(executionId)
-                    .messageId(messageId)
-                    .sessionId(params.getSessionId())
-                    .traceId(traceId)
-                    .source("client")
-                    .targetAgentType(params.getTargetAgentType())
-                    .userCode(params.getUserCode())
-                    .region(region)
-                    .priority(priority)
-                    .policy(resolvedPolicy)
-                    .timeoutMs(availabilityTimeoutMs)
-                    .metadata(params.getMetadata())
-                    .commandPayload(commandPayload)
-                    .build();
+            DeliveryIntent intent = buildDeliveryIntent(
+                    params, executionId, messageId, traceId, resolvedPolicy,
+                    availabilityTimeoutMs, region, priority
+            );
 
             AvailabilityResult availResult = availabilityRouter.prepareDelivery(intent);
 
@@ -598,26 +564,7 @@ public class GatewayClient<T> {
                     .metadata(params.getMetadata())
                     .build();
 
-            Map<String, Object> payloadMap = new HashMap<>(params.getPayload());
-            Object command = ActionType.RESUME.equals(params.getActionType())
-                    ? ResumeCommand.of(
-                            header,
-                            params.getContent(),
-                            (String) payloadMap.getOrDefault(Constants.RedisFields.STATUS, ""),
-                            payloadMap.get(Constants.RedisFields.REPLY_DATA),
-                            payloadMap.entrySet().stream()
-                                    .filter(entry -> !Constants.RedisFields.STATUS.equals(entry.getKey())
-                                            && !Constants.RedisFields.REPLY_DATA.equals(entry.getKey()))
-                                    .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()),
-                                            HashMap::putAll))
-                    : AskAgentCommand.of(
-                            header,
-                            params.getContent(),
-                            Boolean.TRUE.equals(payloadMap.get("wait_for_reply")),
-                            payloadMap.entrySet().stream()
-                                    .filter(entry -> !"wait_for_reply".equals(entry.getKey()))
-                                    .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()),
-                                            HashMap::putAll));
+            Object command = buildGatewayCommand(params, header);
 
             try {
                 registry.initializeExecution(executionId, messageId, params.getSessionId(),
@@ -666,6 +613,76 @@ public class GatewayClient<T> {
                     .timestamp(System.currentTimeMillis())
                     .build();
         }
+    }
+
+    private DeliveryIntent buildDeliveryIntent(
+            SendMessageParams params,
+            String executionId,
+            String messageId,
+            String traceId,
+            String resolvedPolicy,
+            long availabilityTimeoutMs,
+            String region,
+            String priority) {
+        Map<String, Object> headerMap = new HashMap<>();
+        headerMap.put("message_id", messageId);
+        headerMap.put("session_id", params.getSessionId());
+        headerMap.put("trace_id", traceId);
+        headerMap.put("source_agent_type", "");
+        headerMap.put("target_agent_type", params.getTargetAgentType());
+        headerMap.put("parent_message_id", params.getParentMessageId());
+        headerMap.put("task_group_id", "");
+        headerMap.put("user_code", params.getUserCode());
+        headerMap.put("user_name", params.getUserName());
+        headerMap.put("metadata", params.getMetadata());
+
+        Map<String, Object> bodyMap = new HashMap<>();
+        bodyMap.put("content", params.getContent());
+        bodyMap.put("wait_for_reply", Boolean.TRUE.equals(params.getPayload().get("wait_for_reply")));
+
+        Map<String, Object> commandPayload = new HashMap<>();
+        commandPayload.put("action_type", params.getActionType());
+        commandPayload.put("header", headerMap);
+        commandPayload.put("body", bodyMap);
+
+        return DeliveryIntent.builder()
+                .executionId(executionId)
+                .messageId(messageId)
+                .sessionId(params.getSessionId())
+                .traceId(traceId)
+                .source("client")
+                .targetAgentType(params.getTargetAgentType())
+                .userCode(params.getUserCode())
+                .region(region)
+                .priority(priority)
+                .policy(resolvedPolicy)
+                .timeoutMs(availabilityTimeoutMs)
+                .metadata(params.getMetadata())
+                .commandPayload(commandPayload)
+                .build();
+    }
+
+    private Object buildGatewayCommand(SendMessageParams params, MessageHeader header) {
+        Map<String, Object> payloadMap = new HashMap<>(params.getPayload());
+        return ActionType.RESUME.equals(params.getActionType())
+                ? ResumeCommand.of(
+                        header,
+                        params.getContent(),
+                        (String) payloadMap.getOrDefault(Constants.RedisFields.STATUS, ""),
+                        payloadMap.get(Constants.RedisFields.REPLY_DATA),
+                        payloadMap.entrySet().stream()
+                                .filter(entry -> !Constants.RedisFields.STATUS.equals(entry.getKey())
+                                        && !Constants.RedisFields.REPLY_DATA.equals(entry.getKey()))
+                                .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()),
+                                        HashMap::putAll))
+                : AskAgentCommand.of(
+                        header,
+                        params.getContent(),
+                        Boolean.TRUE.equals(payloadMap.get("wait_for_reply")),
+                        payloadMap.entrySet().stream()
+                                .filter(entry -> !"wait_for_reply".equals(entry.getKey()))
+                                .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()),
+                                        HashMap::putAll));
     }
 
     public SendResponse sendMessage(String targetAgentType, String sessionId, T content) {
