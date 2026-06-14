@@ -54,6 +54,10 @@ public class WorkerRunner {
     private volatile boolean evictForce = false;
     private final Set<String> deniedAgentTypes = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
+    // Consumer liveness tracking for health check
+    private static final long CONSUMER_HEALTH_TIMEOUT_MS = 30_000L;
+    private volatile long lastConsumerTick = 0L;
+
     public WorkerRunner(GatewayWorker worker) {
         this(worker, RedisClient.getInstance(), null);
     }
@@ -126,6 +130,16 @@ public class WorkerRunner {
             deniedAgentTypes.addAll(denied);
         });
 
+        // Wire health check: if consumer tick hasn't updated within the timeout, the loop is stalled
+        worker.setHealthCheck(() -> {
+            if (lastConsumerTick == 0L) return true; // not yet started
+            return (System.currentTimeMillis() - lastConsumerTick) < CONSUMER_HEALTH_TIMEOUT_MS;
+        });
+        worker.setOnUnhealthy(() -> {
+            LOG.error("[{}] Consumer loop unhealthy; stopping runner", worker.workerId);
+            running.set(false);
+        });
+
         // startHeartbeat checks admin state first; if not active, it skips registerWorkerMembership
         // and calls the lifecycle callback with the startup lifecycle before the loop starts.
         worker.startHeartbeat();
@@ -143,6 +157,8 @@ public class WorkerRunner {
     private void runLoop() {
         while (running.get()) {
             try {
+                lastConsumerTick = System.currentTimeMillis();
+
                 // Lifecycle checks
                 if ("suspended".equals(adminLifecycle)) {
                     Thread.sleep(Constants.LOOP_SLEEP_MS);

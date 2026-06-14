@@ -30,8 +30,12 @@ public class WorkerRegistry {
     private static final TypeReference<Map<String, Object>> MAP_TYPE_REF = new TypeReference<>() {
     };
     private static final Random RANDOM = new Random();
+    private static final String LOCAL_IP = getLocalIpAddress();
 
-    private record WorkerPresence(String token, long lastSeen, boolean legacy) {
+    private record WorkerPresence(String token, long lastSeen, boolean legacy, String ipAddress) {
+        WorkerPresence(String token, long lastSeen, boolean legacy) {
+            this(token, lastSeen, legacy, "");
+        }
     }
 
     public WorkerRegistry(RedisClient redisClient) {
@@ -76,7 +80,7 @@ public class WorkerRegistry {
                 if (current == null) {
                     String result = jedis.set(
                             key,
-                            encodeWorkerPresence(token, now),
+                            encodeWorkerPresence(token, now, LOCAL_IP),
                             SetParams.setParams().nx().ex(leaseTtlSeconds));
                     if (!"OK".equalsIgnoreCase(result)) {
                         return false;
@@ -84,13 +88,13 @@ public class WorkerRegistry {
                 } else if (!token.equals(currentPresence.token())) {
                     return false;
                 } else {
-                    jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(token, now));
+                    jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(token, now, LOCAL_IP));
                 }
             } else {
                 if (currentPresence.token() != null) {
                     return false;
                 }
-                jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(null, now));
+                jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(null, now, LOCAL_IP));
             }
 
             jedis.sadd(Constants.RegistryKeys.KNOWN_WORKERS, workerId);
@@ -266,7 +270,7 @@ public class WorkerRegistry {
         try (Jedis jedis = redisClient.getResource()) {
             String result = jedis.set(
                     presenceKey,
-                    encodeWorkerPresence(token, 0),
+                    encodeWorkerPresence(token, 0, LOCAL_IP),
                     SetParams.setParams().nx().ex(ttlSeconds));
             if (!"OK".equalsIgnoreCase(result)) {
                 throw new RuntimeException("worker_id already in use: " + workerId);
@@ -348,6 +352,7 @@ public class WorkerRegistry {
             Map<String, Object> result = new HashMap<>();
             result.put("agent_types", agentTypes);
             result.put("last_seen", presence.legacy() ? System.currentTimeMillis() : presence.lastSeen());
+            result.put("ip_address", presence.ipAddress());
             return result;
         }
     }
@@ -504,11 +509,12 @@ public class WorkerRegistry {
         }
     }
 
-    private static String encodeWorkerPresence(String token, long lastSeen) {
+    private static String encodeWorkerPresence(String token, long lastSeen, String ipAddress) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("version", PRESENCE_PAYLOAD_VERSION);
         payload.put("token", token);
         payload.put("last_seen", lastSeen);
+        payload.put("ip_address", ipAddress != null ? ipAddress : "");
         try {
             return OBJECT_MAPPER.writeValueAsString(payload);
         } catch (JsonProcessingException e) {
@@ -518,7 +524,7 @@ public class WorkerRegistry {
 
     private static WorkerPresence decodeWorkerPresence(String raw) {
         if (raw == null) {
-            return new WorkerPresence(null, 0, false);
+            return new WorkerPresence(null, 0, false, "");
         }
         try {
             Map<String, Object> payload = OBJECT_MAPPER.readValue(raw, MAP_TYPE_REF);
@@ -528,13 +534,28 @@ public class WorkerRegistry {
             long lastSeen = lastSeenValue instanceof Number number
                     ? number.longValue()
                     : Long.parseLong(String.valueOf(lastSeenValue));
-            return new WorkerPresence(token, lastSeen, false);
+            String ipAddress = payload.get("ip_address") instanceof String s ? s : "";
+            return new WorkerPresence(token, lastSeen, false, ipAddress);
         } catch (Exception ignored) {
             if ("1".equals(raw)) {
-                return new WorkerPresence(null, 0, true);
+                return new WorkerPresence(null, 0, true, "");
             }
-            return new WorkerPresence(raw, 0, true);
+            return new WorkerPresence(raw, 0, true, "");
         }
+    }
+
+    private static String getLocalIpAddress() {
+        try {
+            // Try to find a non-loopback address via UDP trick (no actual connection made)
+            try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
+                socket.connect(java.net.InetAddress.getByName("8.8.8.8"), 80);
+                String addr = socket.getLocalAddress().getHostAddress();
+                if (addr != null && !addr.isBlank() && !addr.startsWith("0.")) return addr;
+            } catch (Exception ignored2) { /* fall through */ }
+            java.net.InetAddress local = java.net.InetAddress.getLocalHost();
+            if (!local.isLoopbackAddress()) return local.getHostAddress();
+        } catch (Exception ignored) { /* best effort */ }
+        return "";
     }
 
     public synchronized void saveExecution(Map<String, Object> execution) {

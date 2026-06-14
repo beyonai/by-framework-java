@@ -50,6 +50,17 @@ public abstract class GatewayWorker {
      */
     private Consumer<Set<String>> denylistRefresh;
 
+    /**
+     * Called before each heartbeat renewal. Returns false if the consumer loop is unhealthy.
+     * When false, the heartbeat stops renewing the lease so the worker is evicted from routing.
+     */
+    private java.util.function.BooleanSupplier healthCheck;
+
+    /**
+     * Called when the health check fails. Allows the runner to initiate shutdown.
+     */
+    private Runnable onUnhealthy;
+
     public GatewayWorker(String workerId) {
         this(workerId, RedisClient.getInstance());
     }
@@ -75,6 +86,14 @@ public abstract class GatewayWorker {
 
     public void setDenylistRefresh(Consumer<Set<String>> denylistRefresh) {
         this.denylistRefresh = denylistRefresh;
+    }
+
+    public void setHealthCheck(java.util.function.BooleanSupplier healthCheck) {
+        this.healthCheck = healthCheck;
+    }
+
+    public void setOnUnhealthy(Runnable onUnhealthy) {
+        this.onUnhealthy = onUnhealthy;
     }
 
     public abstract List<String> getAgentTypes();
@@ -143,6 +162,14 @@ public abstract class GatewayWorker {
 
         heartbeatExecutor.scheduleAtFixedRate(() -> {
             try {
+                // Health check: if consumer loop is stalled, stop renewing the lease
+                if (healthCheck != null && !healthCheck.getAsBoolean()) {
+                    LOG.error("[{}] Heartbeat stopping: consumer loop is unhealthy", workerId);
+                    heartbeatExecutor.shutdown();
+                    if (onUnhealthy != null) onUnhealthy.run();
+                    return;
+                }
+
                 registry.heartbeatWorker(workerId, leaseTtl);
 
                 // Read admin state after each heartbeat
