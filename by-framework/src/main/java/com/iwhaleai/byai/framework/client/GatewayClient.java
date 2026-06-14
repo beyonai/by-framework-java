@@ -603,7 +603,7 @@ public class GatewayClient<T> {
                 traceParentSpanId = stableTraceSpanIdHex(messageId + ":client.dispatch");
             }
             ClientDispatchObservation clientDispatchObservation = null;
-            if (params.getParentMessageId() == null || params.getParentMessageId().isBlank()) {
+            if (langfuseParentObservationId.isEmpty()) {
                 clientDispatchObservation = startClientDispatchObservation(
                         traceId,
                         messageId,
@@ -616,6 +616,9 @@ public class GatewayClient<T> {
                         traceParentSpanId);
                 if (clientDispatchObservation != null && !clientDispatchObservation.id().isBlank()) {
                     langfuseParentObservationId = clientDispatchObservation.id();
+                }
+                if (langfuseParentObservationId.isEmpty()) {
+                    langfuseParentObservationId = traceParentSpanId;
                 }
             }
 

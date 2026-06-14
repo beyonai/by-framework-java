@@ -206,6 +206,14 @@ public static final int MAX_RETRY_COUNT = 3;
         public static String sdInstanceDetails(String serviceName) {
             return REDIS_PREFIX + String.format("sd:instances:%s", serviceName);
         }
+
+        public static String workerAdminState(String workerId) {
+            return REDIS_PREFIX + "registry:worker:admin:" + workerId;
+        }
+
+        public static String agentTypeDenied(String agentType) {
+            return REDIS_PREFIX + "registry:agent_type:denied:" + agentType;
+        }
     }
 
     public static class TraceKeys {

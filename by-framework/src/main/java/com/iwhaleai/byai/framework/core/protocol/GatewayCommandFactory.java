@@ -44,5 +44,8 @@ public final class GatewayCommandFactory {
         registerCommand(ActionType.ASK_AGENT, AskAgentCommand.class);
         registerCommand(ActionType.RESUME, ResumeCommand.class);
         registerCommand(ActionType.CANCEL_TASK, CancelTaskCommand.class);
+        registerCommand(ActionType.SUSPEND_WORKER, SuspendWorkerCommand.class);
+        registerCommand(ActionType.RESUME_WORKER, ResumeWorkerCommand.class);
+        registerCommand(ActionType.EVICT_WORKER, EvictWorkerCommand.class);
     }
 }

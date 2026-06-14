@@ -18,12 +18,15 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 public abstract class GatewayWorker {
     private static final Logger LOG = LoggerFactory.getLogger(GatewayWorker.class);
@@ -34,6 +37,18 @@ public abstract class GatewayWorker {
     protected final PluginRegistry pluginRegistry;
     protected final ObjectMapper objectMapper = new ObjectMapper();
     private ScheduledExecutorService heartbeatExecutor;
+
+    /**
+     * Called after each heartbeat with the latest admin lifecycle value ("active", "suspended", "evicted").
+     * Set by WorkerRunner to update its internal state machine.
+     */
+    private Consumer<String> lifecycleCallback;
+
+    /**
+     * Called after each heartbeat with the set of denied agent types for this worker.
+     * Set by WorkerRunner to update its denylist cache.
+     */
+    private Consumer<Set<String>> denylistRefresh;
 
     public GatewayWorker(String workerId) {
         this(workerId, RedisClient.getInstance());
@@ -52,6 +67,14 @@ public abstract class GatewayWorker {
 
     public PluginRegistry getPluginRegistry() {
         return pluginRegistry;
+    }
+
+    public void setLifecycleCallback(Consumer<String> lifecycleCallback) {
+        this.lifecycleCallback = lifecycleCallback;
+    }
+
+    public void setDenylistRefresh(Consumer<Set<String>> denylistRefresh) {
+        this.denylistRefresh = denylistRefresh;
     }
 
     public abstract List<String> getAgentTypes();
@@ -84,8 +107,33 @@ public abstract class GatewayWorker {
         int leaseTtl = getHeartbeatLeaseTtlSeconds();
         int interval = getHeartbeatIntervalSeconds();
 
+        // Read admin-controlled lifecycle BEFORE registering membership.
+        // A worker that restarts while suspended must not re-join the
+        // agent_type:members sets or start consuming until explicitly resumed.
+        String startupLifecycle = "active";
+        try {
+            Map<String, String> adminState = registry.getWorkerAdminState(workerId);
+            String lc = adminState.get("lifecycle");
+            if (lc != null && !lc.isEmpty()) {
+                startupLifecycle = lc;
+            }
+        } catch (Exception e) {
+            LOG.warn("[{}] Failed to read admin state at startup: {}", workerId, e.getMessage());
+        }
+
+        if (!"active".equals(startupLifecycle)) {
+            LOG.warn("[{}] Startup admin lifecycle is '{}'; skipping member registration — worker will not consume until resumed",
+                    workerId, startupLifecycle);
+            // Propagate the startup lifecycle to the runner immediately
+            if (lifecycleCallback != null) {
+                lifecycleCallback.accept(startupLifecycle);
+            }
+        }
+
         registry.heartbeatWorker(workerId, leaseTtl);
         pluginRegistry.onWorkerStartup(this);
+
+        final String[] currentLifecycle = {startupLifecycle};
 
         heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-" + workerId);
@@ -96,6 +144,31 @@ public abstract class GatewayWorker {
         heartbeatExecutor.scheduleAtFixedRate(() -> {
             try {
                 registry.heartbeatWorker(workerId, leaseTtl);
+
+                // Read admin state after each heartbeat
+                Map<String, String> adminState = registry.getWorkerAdminState(workerId);
+                String lc = adminState.get("lifecycle");
+                currentLifecycle[0] = (lc != null && !lc.isEmpty()) ? lc : "active";
+
+                if (lifecycleCallback != null) {
+                    lifecycleCallback.accept(currentLifecycle[0]);
+                }
+
+                // Self-healing: re-register membership when active
+                if ("active".equals(currentLifecycle[0])) {
+                    registry.registerWorkerMembership(workerId, getAgentTypes());
+                }
+
+                // Refresh denylist for each agent type
+                if (denylistRefresh != null) {
+                    Set<String> denied = new HashSet<>();
+                    for (String agentType : getAgentTypes()) {
+                        if (registry.isWorkerDeniedForType(agentType, workerId)) {
+                            denied.add(agentType);
+                        }
+                    }
+                    denylistRefresh.accept(denied);
+                }
             } catch (Exception e) {
                 LOG.error("[{}] Heartbeat failed: {}", workerId, e.getMessage());
             }

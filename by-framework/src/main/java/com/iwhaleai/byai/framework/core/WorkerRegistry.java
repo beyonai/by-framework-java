@@ -360,11 +360,147 @@ public class WorkerRegistry {
                 for (String id : workerIds) {
                     Map<String, Object> data = getWorker(id);
                     if (data != null) {
+                        Map<String, String> adminState = getWorkerAdminState(id);
+                        data.put("lifecycle", adminState.getOrDefault("lifecycle", "active"));
+                        data.put("lifecycle_reason", adminState.getOrDefault("reason", ""));
                         result.put(id, data);
                     }
                 }
             }
             return result;
+        }
+    }
+
+    /**
+     * Set admin-controlled lifecycle state for a worker.
+     *
+     * @param workerId  Worker ID
+     * @param lifecycle One of "active", "suspended", "evicted"
+     * @param reason    Human-readable reason for the state change
+     */
+    public synchronized void setWorkerAdminState(String workerId, String lifecycle, String reason) {
+        String key = Constants.RegistryKeys.workerAdminState(workerId);
+        long now = System.currentTimeMillis();
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.hset(key, "lifecycle", lifecycle);
+            jedis.hset(key, "reason", reason != null ? reason : "");
+            jedis.hset(key, "updated_at", String.valueOf(now));
+        }
+    }
+
+    /**
+     * Get admin-controlled state for a worker.
+     *
+     * @param workerId Worker ID
+     * @return Map with fields: lifecycle, reason, updated_at (empty map if not set)
+     */
+    public Map<String, String> getWorkerAdminState(String workerId) {
+        String key = Constants.RegistryKeys.workerAdminState(workerId);
+        try (Jedis jedis = redisClient.getResource()) {
+            Map<String, String> raw = jedis.hgetAll(key);
+            return raw != null ? raw : new HashMap<>();
+        }
+    }
+
+    /**
+     * Remove admin state for a worker, restoring default-active behaviour.
+     *
+     * @param workerId Worker ID
+     */
+    public synchronized void clearWorkerAdminState(String workerId) {
+        String key = Constants.RegistryKeys.workerAdminState(workerId);
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.del(key);
+        }
+    }
+
+    /**
+     * SREM worker_id from every agent_type:members set it currently belongs to.
+     * Preserves the declared-agent-types key so membership can be restored later.
+     * Used by suspend and evict to make the worker immediately invisible to routing.
+     *
+     * @param workerId Worker ID
+     */
+    public synchronized void removeWorkerFromTypeMembers(String workerId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+            if (agentTypes != null) {
+                for (String agentType : agentTypes) {
+                    jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
+                }
+            }
+        }
+    }
+
+    /**
+     * SADD worker_id back to every agent_type:members set it declared.
+     * Used by resume to make the worker immediately visible to routing again.
+     * Denylist is still respected — denied types are excluded.
+     *
+     * @param workerId Worker ID
+     */
+    public synchronized void restoreWorkerToTypeMembers(String workerId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+            if (agentTypes != null) {
+                for (String agentType : agentTypes) {
+                    if (!isWorkerDeniedForType(agentType, workerId)) {
+                        jedis.sadd(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Add worker_id to the denylist for agent_type.
+     * The worker will stop being added to agent_type:workers and skip XREADGROUP for that stream.
+     *
+     * @param agentType Agent type
+     * @param workerId  Worker ID
+     */
+    public synchronized void denyWorkerForType(String agentType, String workerId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.sadd(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
+            jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
+        }
+    }
+
+    /**
+     * Remove worker_id from the denylist for agent_type.
+     *
+     * @param agentType Agent type
+     * @param workerId  Worker ID
+     */
+    public synchronized void allowWorkerForType(String agentType, String workerId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.srem(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
+        }
+    }
+
+    /**
+     * Return true if worker_id is on the denylist for agent_type.
+     *
+     * @param agentType Agent type
+     * @param workerId  Worker ID
+     * @return true if denied
+     */
+    public boolean isWorkerDeniedForType(String agentType, String workerId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.sismember(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
+        }
+    }
+
+    /**
+     * Return all worker_ids on the denylist for agent_type.
+     *
+     * @param agentType Agent type
+     * @return List of denied worker IDs
+     */
+    public List<String> getAgentTypeDenylist(String agentType) {
+        try (Jedis jedis = redisClient.getResource()) {
+            Set<String> members = jedis.smembers(Constants.RegistryKeys.agentTypeDenied(agentType));
+            return members != null ? new ArrayList<>(members) : Collections.emptyList();
         }
     }
 

@@ -4,9 +4,12 @@ import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
+import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommandFactory;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
+import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
@@ -20,6 +23,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,6 +48,11 @@ public class WorkerRunner {
     private final ConcurrentHashMap<String, String> messageToExecution = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private String lockToken;
+
+    // Admin lifecycle state machine
+    private volatile String adminLifecycle = "active";
+    private volatile boolean evictForce = false;
+    private final Set<String> deniedAgentTypes = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     public WorkerRunner(GatewayWorker worker) {
         this(worker, RedisClient.getInstance(), null);
@@ -103,9 +112,28 @@ public class WorkerRunner {
 
         this.lockToken = worker.registry.claimWorkerId(worker.workerId);
 
-        worker.registry.registerWorkerMembership(worker.workerId, worker.getAgentTypes());
+        // Wire lifecycle callback to update runner state from heartbeat thread
+        worker.setLifecycleCallback(lifecycle -> {
+            adminLifecycle = lifecycle;
+            if ("evicted".equals(lifecycle)) {
+                LOG.info("[{}] Eviction signaled via lifecycle callback", worker.workerId);
+            }
+        });
 
+        // Wire denylist refresh callback
+        worker.setDenylistRefresh(denied -> {
+            deniedAgentTypes.clear();
+            deniedAgentTypes.addAll(denied);
+        });
+
+        // startHeartbeat checks admin state first; if not active, it skips registerWorkerMembership
+        // and calls the lifecycle callback with the startup lifecycle before the loop starts.
         worker.startHeartbeat();
+
+        // Only register membership if active (startHeartbeat may have set adminLifecycle already)
+        if ("active".equals(adminLifecycle)) {
+            worker.registry.registerWorkerMembership(worker.workerId, worker.getAgentTypes());
+        }
 
         LOG.info("[{}] Runner started, waiting for tasks...", worker.workerId);
 
@@ -115,11 +143,25 @@ public class WorkerRunner {
     private void runLoop() {
         while (running.get()) {
             try {
-                Map<String, redis.clients.jedis.StreamEntryID> streams = new HashMap<>();
-                for (String agentType : worker.getAgentTypes()) {
-                    streams.put(Constants.QueueNames.ctrlStream(agentType),
-                            redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
+                // Lifecycle checks
+                if ("suspended".equals(adminLifecycle)) {
+                    Thread.sleep(Constants.LOOP_SLEEP_MS);
+                    continue;
                 }
+                if ("evicted".equals(adminLifecycle)) {
+                    LOG.info("[{}] Eviction requested; stopping consumer loop", worker.workerId);
+                    break;
+                }
+
+                Map<String, redis.clients.jedis.StreamEntryID> streams = new HashMap<>();
+                // Filter out denied agent types
+                for (String agentType : worker.getAgentTypes()) {
+                    if (!deniedAgentTypes.contains(agentType)) {
+                        streams.put(Constants.QueueNames.ctrlStream(agentType),
+                                redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
+                    }
+                }
+                // Always include per-worker control stream (for lifecycle commands)
                 streams.put(Constants.QueueNames.workerCtrlStream(worker.workerId),
                         redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
 
@@ -160,6 +202,19 @@ public class WorkerRunner {
                 }
             }
         }
+
+        // Handle post-eviction shutdown
+        if ("evicted".equals(adminLifecycle)) {
+            LOG.info("[{}] Worker evicted (force={}), initiating shutdown", worker.workerId, evictForce);
+            if (evictForce) {
+                // Force: interrupt all active executions immediately
+                for (Thread t : activeExecutions.values()) {
+                    t.interrupt();
+                }
+            }
+            // Signal the runner to stop (stop() does the actual cleanup)
+            stop();
+        }
     }
 
     private void processMessageAsync(String streamName, StreamEntry entry) {
@@ -173,9 +228,21 @@ public class WorkerRunner {
                 GatewayCommand command = GatewayCommandFactory.fromJson(dataStr);
                 MessageHeader header = command.header();
 
-                // 1. Handle Control Commands (e.g. CancelTaskCommand)
+                // 1. Handle Control Commands (e.g. CancelTaskCommand, lifecycle commands)
                 if (command instanceof CancelTaskCommand cancelCmd) {
                     handleControlCommand(streamName, entry.getID(), cancelCmd);
+                    return;
+                }
+                if (command instanceof SuspendWorkerCommand suspendCmd) {
+                    handleSuspendWorker(streamName, entry.getID(), suspendCmd);
+                    return;
+                }
+                if (command instanceof ResumeWorkerCommand resumeCmd) {
+                    handleResumeWorker(streamName, entry.getID(), resumeCmd);
+                    return;
+                }
+                if (command instanceof EvictWorkerCommand evictCmd) {
+                    handleEvictWorker(streamName, entry.getID(), evictCmd);
                     return;
                 }
 
@@ -269,6 +336,49 @@ public class WorkerRunner {
             }
         } catch (Exception e) {
             LOG.error("Error handling control command: {}", e.getMessage());
+        }
+    }
+
+    private void handleSuspendWorker(String streamName, redis.clients.jedis.StreamEntryID streamId,
+            SuspendWorkerCommand command) {
+        try {
+            LOG.info("[{}] Worker suspended by admin: {}", worker.workerId,
+                    command.body() != null ? command.body().reason() : "");
+            adminLifecycle = "suspended";
+            try (Jedis jedis = redisClient.getResource()) {
+                jedis.xack(streamName, groupName, streamId);
+            }
+        } catch (Exception e) {
+            LOG.error("[{}] Error handling SuspendWorkerCommand: {}", worker.workerId, e.getMessage());
+        }
+    }
+
+    private void handleResumeWorker(String streamName, redis.clients.jedis.StreamEntryID streamId,
+            ResumeWorkerCommand command) {
+        try {
+            LOG.info("[{}] Worker resumed by admin", worker.workerId);
+            adminLifecycle = "active";
+            try (Jedis jedis = redisClient.getResource()) {
+                jedis.xack(streamName, groupName, streamId);
+            }
+        } catch (Exception e) {
+            LOG.error("[{}] Error handling ResumeWorkerCommand: {}", worker.workerId, e.getMessage());
+        }
+    }
+
+    private void handleEvictWorker(String streamName, redis.clients.jedis.StreamEntryID streamId,
+            EvictWorkerCommand command) {
+        try {
+            boolean force = command.body() != null && command.body().force();
+            String reason = command.body() != null ? command.body().reason() : "";
+            LOG.info("[{}] Worker evicted by admin (force={}, reason={})", worker.workerId, force, reason);
+            evictForce = force;
+            adminLifecycle = "evicted";
+            try (Jedis jedis = redisClient.getResource()) {
+                jedis.xack(streamName, groupName, streamId);
+            }
+        } catch (Exception e) {
+            LOG.error("[{}] Error handling EvictWorkerCommand: {}", worker.workerId, e.getMessage());
         }
     }
 
