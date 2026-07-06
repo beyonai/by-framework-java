@@ -6,8 +6,8 @@ import com.iwhaleai.byai.framework.common.RedisClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.ScanParams;
-import redis.clients.jedis.ScanResult;
+import redis.clients.jedis.params.ScanParams;
+import redis.clients.jedis.resps.ScanResult;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -140,7 +140,7 @@ public class MetricsCollector {
         Set<String> agentTypeSet = new HashSet<>();
         for (String wid : workerIds) {
             try {
-                Set<String> types = jedis.smembers(Constants.QueueNames.workerDeclaredAgentTypes(wid));
+                Set<String> types = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(wid));
                 agentTypeSet.addAll(types);
             } catch (Exception ignored) { }
         }
@@ -195,7 +195,7 @@ public class MetricsCollector {
     }
 
     private List<String> scanOnlineWorkerIds(Jedis jedis, int limit) {
-        String prefix = Constants.QueueNames.workerOnlineLease("");
+        String prefix = Constants.RegistryKeys.workerOnlineLease("");
         ScanParams params = new ScanParams().match(prefix + "*").count(100);
         Set<String> result = new HashSet<>();
         String cursor = ScanParams.SCAN_POINTER_START;
