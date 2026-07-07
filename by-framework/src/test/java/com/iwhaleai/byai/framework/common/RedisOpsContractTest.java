@@ -86,6 +86,12 @@ abstract class RedisOpsContractTest {
     }
 
     @Test
+    void hsetAllDelegates() {
+        when(redisCommandsMock().hset("k", Map.of("f1", "v1", "f2", "v2"))).thenReturn(2L);
+        assertEquals(2L, ops().hsetAll("k", Map.of("f1", "v1", "f2", "v2")));
+    }
+
+    @Test
     void hincrByDelegates() {
         when(redisCommandsMock().hincrBy("k", "f", 1L)).thenReturn(5L);
         assertEquals(5L, ops().hincrBy("k", "f", 1L));

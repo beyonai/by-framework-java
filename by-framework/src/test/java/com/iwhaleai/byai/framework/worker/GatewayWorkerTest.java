@@ -12,6 +12,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XAddParams;
 
 import java.util.*;
 
@@ -34,14 +35,11 @@ class GatewayWorkerTest {
     @Mock
     private com.iwhaleai.byai.framework.core.WorkerRegistry registry;
 
-    @Mock
-    private redis.clients.jedis.Pipeline pipeline;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @BeforeEach
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
-        lenient().when(jedis.pipelined()).thenReturn(pipeline);
     }
 
     private static class EchoWorker extends GatewayWorker {
@@ -192,7 +190,7 @@ class GatewayWorkerTest {
 
         // Verify state emission
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasCancelledState = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(AgentState.CANCELLED));
@@ -225,7 +223,7 @@ class GatewayWorkerTest {
 
         // Should emit COMPLETED state (no source_agent_type, so not a callback)
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasCompletedState = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(AgentState.COMPLETED));
@@ -320,7 +318,7 @@ class GatewayWorkerTest {
         worker.handleMessage(command, "exec-test-id");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasResumedState = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(AgentState.RESUMED));
@@ -345,7 +343,7 @@ class GatewayWorkerTest {
         worker.handleMessage(command, "exec-test-id");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasFailedState = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(AgentState.FAILED));
@@ -519,7 +517,7 @@ class GatewayWorkerTest {
 
         // Should emit COMPLETED, not QUEUED
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasCompletedState = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(AgentState.COMPLETED));

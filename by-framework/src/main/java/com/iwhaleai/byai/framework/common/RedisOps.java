@@ -42,6 +42,9 @@ public interface RedisOps {
 
     void hset(String key, String field, String value);
 
+    /** Bulk HSET: writes every field in one round trip instead of one HSET per field. */
+    long hsetAll(String key, Map<String, String> fields);
+
     long hincrBy(String key, String field, long value);
 
     long sadd(String key, String... members);
