@@ -15,8 +15,6 @@ import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.params.XReadGroupParams;
 import redis.clients.jedis.resps.StreamEntry;
 
 import java.nio.charset.StandardCharsets;
@@ -28,8 +26,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.UUID;
@@ -53,6 +53,10 @@ public class WorkerRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean evictionHandled = new AtomicBoolean(false);
     private String lockToken;
+
+    // Round-robin cursor for the agent_type phase-two blocking primary.
+    // Only ever touched by the single agent_type loop thread.
+    private int primaryCursor = 0;
 
     // Admin lifecycle state machine
     private volatile String adminLifecycle = "active";
@@ -174,35 +178,24 @@ public class WorkerRunner {
                     break;
                 }
 
-                Map<String, redis.clients.jedis.StreamEntryID> streams = new HashMap<>();
-                // Filter out denied agent types
+                List<String> agentTypes = new ArrayList<>();
                 for (String agentType : worker.getAgentTypes()) {
                     if (!deniedAgentTypes.contains(agentType)) {
-                        streams.put(Constants.QueueNames.ctrlStream(agentType),
-                                redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
+                        agentTypes.add(agentType);
                     }
                 }
 
-                if (streams.isEmpty()) {
+                if (agentTypes.isEmpty()) {
                     Thread.sleep(Constants.LOOP_SLEEP_MS);
                     continue;
                 }
 
-                try (Jedis jedis = redisClient.getResource()) {
-                    List<Map.Entry<String, List<StreamEntry>>> results = jedis.xreadGroup(
-                            groupName,
-                            consumerName,
-                            XReadGroupParams.xReadGroupParams()
-                                    .count(Constants.REDIS_READ_BATCH_SIZE)
-                                    .block(Constants.REDIS_BLOCK_TIMEOUT_MS),
-                            streams);
-
-                    if (results != null) {
-                        for (Map.Entry<String, List<StreamEntry>> entry : results) {
-                            String streamName = entry.getKey();
-                            for (StreamEntry streamEntry : entry.getValue()) {
-                                processMessageAsync(streamName, streamEntry);
-                            }
+                List<Map.Entry<String, List<StreamEntry>>> results = fetchAgentTypeMessages(agentTypes);
+                if (results != null) {
+                    for (Map.Entry<String, List<StreamEntry>> entry : results) {
+                        String streamName = entry.getKey();
+                        for (StreamEntry streamEntry : entry.getValue()) {
+                            processMessageAsync(streamName, streamEntry);
                         }
                     }
                 }
@@ -222,6 +215,58 @@ public class WorkerRunner {
         }
 
         handlePostEvictionShutdownIfNeeded();
+    }
+
+    /**
+     * Two-phase, Cluster-safe read across every active agent_type stream.
+     * Each agent_type is its own untagged entity/slot, so they can never be
+     * combined into one xreadGroup() call.
+     *
+     * <p>Phase one: a concurrent, non-blocking single-stream read per active
+     * agent_type. If any stream returned messages, return immediately -
+     * this is what keeps the common case fast without ever blocking.
+     *
+     * <p>Phase two: only when every stream came back empty, one real
+     * blocking read against a single "primary" stream, chosen by
+     * round-robin across the declared agent_types so no agent_type is
+     * permanently starved of the blocking slot. A message that arrives on
+     * a non-primary stream mid-block waits at most until this block ends
+     * (bounded by REDIS_BLOCK_TIMEOUT_MS), then gets picked up by the next
+     * iteration's phase-one scan.
+     */
+    private List<Map.Entry<String, List<StreamEntry>>> fetchAgentTypeMessages(List<String> agentTypes)
+            throws InterruptedException {
+        List<String> streamNames = new ArrayList<>();
+        for (String agentType : agentTypes) {
+            streamNames.add(Constants.QueueNames.ctrlStream(agentType));
+        }
+
+        List<Future<List<Map.Entry<String, List<StreamEntry>>>>> futures = new ArrayList<>();
+        for (String streamName : streamNames) {
+            futures.add(taskExecutor.submit(() -> streamOps.xreadGroup(
+                    streamName, groupName, consumerName, Constants.REDIS_READ_BATCH_SIZE, null)));
+        }
+
+        List<Map.Entry<String, List<StreamEntry>>> combined = new ArrayList<>();
+        for (Future<List<Map.Entry<String, List<StreamEntry>>>> future : futures) {
+            try {
+                List<Map.Entry<String, List<StreamEntry>>> result = future.get();
+                if (result != null) {
+                    combined.addAll(result);
+                }
+            } catch (ExecutionException e) {
+                LOG.error("Error in agent_type phase-one scan: {}",
+                        e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+            }
+        }
+        if (!combined.isEmpty()) {
+            return combined;
+        }
+
+        String primary = streamNames.get(Math.floorMod(primaryCursor, streamNames.size()));
+        primaryCursor++;
+        return streamOps.xreadGroup(
+                primary, groupName, consumerName, Constants.REDIS_READ_BATCH_SIZE, Constants.REDIS_BLOCK_TIMEOUT_MS);
     }
 
     /**
