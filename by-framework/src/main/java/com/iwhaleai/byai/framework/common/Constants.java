@@ -7,6 +7,23 @@ public class Constants {
     public static final int TRACE_TTL_SECONDS = 15 * 60;
     public static final java.util.Set<String> TERMINAL_STATES = java.util.Set.of("COMPLETED", "FAILED", "CANCELLED", "SUCCESS");
 
+    /**
+     * Return the configured Redis key schema version ("v1" or "v2").
+     *
+     * <p>Controlled by REDIS_KEY_SCHEMA_VERSION, defaulting to "v1" (the
+     * current unprefixed key format). Cluster mode requires "v2" (see
+     * RedisClient's fail-fast check).
+     */
+    public static String getKeySchemaVersion() {
+        String version = com.iwhaleai.byai.framework.config.GatewayConfig.get(
+                "REDIS_KEY_SCHEMA_VERSION", "v1");
+        if (!"v1".equals(version) && !"v2".equals(version)) {
+            throw new IllegalArgumentException(
+                    "Invalid REDIS_KEY_SCHEMA_VERSION: " + version + " (must be 'v1' or 'v2')");
+        }
+        return version;
+    }
+
     // Redis Stream field keys
     public static class RedisFields {
         public static final String DATA = "data";

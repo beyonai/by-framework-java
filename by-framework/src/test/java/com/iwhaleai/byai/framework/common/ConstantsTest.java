@@ -1,5 +1,6 @@
 package com.iwhaleai.byai.framework.common;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -10,6 +11,28 @@ import static org.junit.jupiter.api.Assertions.*;
  * Tests for Constants - ConsumerGroups autoGroupName method.
  */
 class ConstantsTest {
+
+    @AfterEach
+    void clearKeySchemaVersionProperty() {
+        System.clearProperty("REDIS_KEY_SCHEMA_VERSION");
+    }
+
+    @Test
+    void keySchemaVersionDefaultsToV1() {
+        assertEquals("v1", Constants.getKeySchemaVersion());
+    }
+
+    @Test
+    void keySchemaVersionAcceptsExplicitV2() {
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v2");
+        assertEquals("v2", Constants.getKeySchemaVersion());
+    }
+
+    @Test
+    void keySchemaVersionRejectsInvalidValue() {
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v3");
+        assertThrows(IllegalArgumentException.class, Constants::getKeySchemaVersion);
+    }
 
     @Test
     void autoGroupNameGeneratesConsistentHashForSameInput() {
