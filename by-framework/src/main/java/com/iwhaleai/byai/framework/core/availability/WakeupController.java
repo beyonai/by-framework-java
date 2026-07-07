@@ -1,12 +1,17 @@
 package com.iwhaleai.byai.framework.core.availability;
 
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
 import redis.clients.jedis.StreamEntryID;
 import redis.clients.jedis.params.SetParams;
-import redis.clients.jedis.params.XReadParams;
 import redis.clients.jedis.resps.StreamEntry;
 
 import java.util.HashMap;
@@ -20,7 +25,8 @@ import java.util.Map;
 @Slf4j
 public class WakeupController {
 
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
+    private final RedisStreamOps streamOps;
     private final WakeupProvider wakeupProvider;
     private final int dedupeTtlSeconds;
     private final int maxAttempts;
@@ -30,7 +36,12 @@ public class WakeupController {
     }
 
     public WakeupController(RedisClient redisClient, WakeupProvider wakeupProvider, int dedupeTtlSeconds, int maxAttempts) {
-        this.redisClient = redisClient;
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient);
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.wakeupProvider = wakeupProvider;
         this.dedupeTtlSeconds = dedupeTtlSeconds;
         this.maxAttempts = maxAttempts;
@@ -48,11 +59,10 @@ public class WakeupController {
         String streamName = Constants.QueueNames.controlPlaneManagementStream();
         StreamEntryID startId = lastId != null ? lastId : new StreamEntryID("0-0");
 
-        try (Jedis jedis = redisClient.getResource()) {
+        try {
             int blockMsInt = (int) Math.min(blockMs, Integer.MAX_VALUE);
-            XReadParams xReadParams = XReadParams.xReadParams().count(1).block(blockMsInt);
-            Map<String, StreamEntryID> streamMap = Map.of(streamName, startId);
-            List<Map.Entry<String, List<StreamEntry>>> results = jedis.xread(xReadParams, streamMap);
+            List<Map.Entry<String, List<StreamEntry>>> results =
+                    streamOps.xread(streamName, startId, 1, blockMsInt);
 
             if (results == null || results.isEmpty()) {
                 return null;
@@ -60,7 +70,7 @@ public class WakeupController {
 
             for (Map.Entry<String, List<StreamEntry>> result : results) {
                 for (StreamEntry entry : result.getValue()) {
-                    processWakeupEntry(jedis, entry);
+                    processWakeupEntry(entry);
                     return entry.getID();
                 }
             }
@@ -71,7 +81,7 @@ public class WakeupController {
         return null;
     }
 
-    private void processWakeupEntry(Jedis jedis, StreamEntry entry) {
+    private void processWakeupEntry(StreamEntry entry) {
         Map<String, String> fields = entry.getFields();
         WakeupRequest request = WakeupRequest.fromDict(fields);
         if (request == null || request.getExecutionId() == null || request.getExecutionId().isEmpty()) {
@@ -82,7 +92,7 @@ public class WakeupController {
         // Dedupe check (aligned with Python: SET NX with TTL)
         String dedupeKey = Constants.QueueNames.controlPlaneWakeupDedupe(
                 request.getTargetAgentType(), request.getUserCode(), request.getRegion());
-        String dedupeVal = jedis.get(dedupeKey);
+        String dedupeVal = redisOps.get(dedupeKey);
         int attempts = 0;
         if (dedupeVal != null) {
             try {
@@ -96,7 +106,7 @@ public class WakeupController {
         }
 
         // Atomically claim the wakeup (SET NX with TTL, matching Python's SET EX NX)
-        String result = jedis.set(dedupeKey, request.getExecutionId(),
+        String result = redisOps.set(dedupeKey, request.getExecutionId(),
                 SetParams.setParams().nx().ex(dedupeTtlSeconds));
         if (result == null) {
             // Key already exists — wakeup already claimed
@@ -108,7 +118,7 @@ public class WakeupController {
         log.info("Processing wakeup for agent_type='{}' execution_id={}", request.getTargetAgentType(), request.getExecutionId());
         try {
             WakeupDecision decision = wakeupProvider.wakeup(request);
-            writeDecision(jedis, decision, request);
+            writeDecision(decision, request);
         } catch (Exception e) {
             log.error("Wakeup provider failed for execution_id={}: {}", request.getExecutionId(), e.getMessage(), e);
             WakeupDecision failedDecision = WakeupDecision.builder()
@@ -119,11 +129,11 @@ public class WakeupController {
                     .workerId("")
                     .timestamp(System.currentTimeMillis())
                     .build();
-            writeDecision(jedis, failedDecision, request);
+            writeDecision(failedDecision, request);
         }
     }
 
-    private void writeDecision(Jedis jedis, WakeupDecision decision, WakeupRequest request) {
+    private void writeDecision(WakeupDecision decision, WakeupRequest request) {
         WakeupDecision.WakeupDecisionBuilder builder = WakeupDecision.builder()
                 .executionId(decision.getExecutionId())
                 .status(decision.getStatus())
@@ -141,7 +151,7 @@ public class WakeupController {
         WakeupDecision finalDecision = builder.build();
         String decisionStreamKey = Constants.QueueNames.controlPlaneDecisionStream(finalDecision.getExecutionId());
         Map<String, String> fieldMap = finalDecision.toDict();
-        jedis.xadd(decisionStreamKey, (StreamEntryID) null, new HashMap<>(fieldMap));
-        jedis.expire(decisionStreamKey, 300); // 5-minute TTL for decision streams
+        streamOps.xadd(decisionStreamKey, new HashMap<>(fieldMap), XAddOptions.noTrim());
+        redisOps.expire(decisionStreamKey, 300); // 5-minute TTL for decision streams
     }
 }
