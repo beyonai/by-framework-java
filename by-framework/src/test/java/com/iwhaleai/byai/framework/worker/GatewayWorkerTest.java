@@ -11,7 +11,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.StreamEntryID;
 import redis.clients.jedis.params.XAddParams;
 
 import java.util.*;
@@ -371,7 +370,7 @@ class GatewayWorkerTest {
         // Should enqueue callback to caller-agent's ctrl stream
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis, atLeastOnce()).xadd(eq(callerStream), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(eq(callerStream), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasResumeCallback = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains(ActionType.RESUME));
@@ -400,7 +399,7 @@ class GatewayWorkerTest {
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis, atLeastOnce()).xadd(eq(callerStream), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(eq(callerStream), any(XAddParams.class), fieldsCaptor.capture());
 
         Map<String, Object> callback = fieldsCaptor.getAllValues().stream()
                 .map(fields -> fields.get("data"))
@@ -448,7 +447,7 @@ class GatewayWorkerTest {
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis, atLeastOnce()).xadd(eq(callerStream), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(eq(callerStream), any(XAddParams.class), fieldsCaptor.capture());
 
         boolean hasFailedCallback = fieldsCaptor.getAllValues().stream()
                 .anyMatch(f -> f.get("data") != null && f.get("data").contains("FAILED"));

@@ -1,8 +1,15 @@
 package com.iwhaleai.byai.framework.worker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.config.ConfigHolder;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import com.iwhaleai.byai.framework.core.extensions.PluginRegistry;
@@ -15,7 +22,6 @@ import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.protocol.EventType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import redis.clients.jedis.Jedis;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,6 +39,8 @@ public abstract class GatewayWorker {
 
     protected final String workerId;
     protected final RedisClient redisClient;
+    private final RedisOps redisOps;
+    private final RedisStreamOps streamOps;
     protected final WorkerRegistry registry;
     protected final PluginRegistry pluginRegistry;
     protected final ObjectMapper objectMapper = new ObjectMapper();
@@ -72,6 +80,12 @@ public abstract class GatewayWorker {
     protected GatewayWorker(String workerId, RedisClient redisClient, WorkerRegistry registry) {
         this.workerId = workerId;
         this.redisClient = redisClient;
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient);
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.registry = registry;
         this.pluginRegistry = new PluginRegistry();
     }
@@ -342,34 +356,32 @@ public abstract class GatewayWorker {
     private boolean handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
         String taskGroupId = header.taskGroupId();
         if (taskGroupId != null && !taskGroupId.isBlank()) {
-            try (Jedis jedis = redisClient.getResource()) {
-                String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
-                String totalStr = jedis.hget(groupKey, "total");
-                if (totalStr != null) {
-                    if (command instanceof ResumeCommand resumeCommand) {
-                        String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
-                        Map<String, Object> resultData = new HashMap<>();
-                        resultData.put("status", resumeCommand.status());
-                        resultData.put("reply_data", resumeCommand.replyData());
-                        resultData.put("content", resumeCommand.content());
-                        resultData.put("metadata", resumeCommand.header().metadata());
-                        resultData.put("extra_payload", resumeCommand.extraPayload());
-                        jedis.hset(
-                                resultsKey,
-                                header.messageId(),
-                                objectMapper.writeValueAsString(resultData)
-                        );
-                        jedis.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
-                    }
-                    long completed = jedis.hincrBy(groupKey, "completed", 1);
-                    int total = Integer.parseInt(totalStr);
-                    if (completed < total) {
-                        LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
-                        context.emitState(AgentState.QUEUED + ": waiting_for_group");
-                        return false;
-                    }
-                    LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
+            String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
+            String totalStr = redisOps.hget(groupKey, "total");
+            if (totalStr != null) {
+                if (command instanceof ResumeCommand resumeCommand) {
+                    String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
+                    Map<String, Object> resultData = new HashMap<>();
+                    resultData.put("status", resumeCommand.status());
+                    resultData.put("reply_data", resumeCommand.replyData());
+                    resultData.put("content", resumeCommand.content());
+                    resultData.put("metadata", resumeCommand.header().metadata());
+                    resultData.put("extra_payload", resumeCommand.extraPayload());
+                    redisOps.hset(
+                            resultsKey,
+                            header.messageId(),
+                            objectMapper.writeValueAsString(resultData)
+                    );
+                    redisOps.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
                 }
+                long completed = redisOps.hincrBy(groupKey, "completed", 1);
+                int total = Integer.parseInt(totalStr);
+                if (completed < total) {
+                    LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
+                    context.emitState(AgentState.QUEUED + ": waiting_for_group");
+                    return false;
+                }
+                LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
             }
         }
         context.emitState(AgentState.RESUMED);
@@ -433,13 +445,13 @@ public abstract class GatewayWorker {
                 new HashMap<>(taskResult.extraPayload())
         );
 
-        try (Jedis jedis = redisClient.getResource()) {
+        try {
             Map<String, String> fields = new HashMap<>();
             fields.put("data", objectMapper.writeValueAsString(callbackMsg));
-            jedis.xadd(
+            streamOps.xadd(
                     Constants.QueueNames.ctrlStream(callbackMsg.header().targetAgentType()),
-                    (redis.clients.jedis.StreamEntryID) null,
-                    fields
+                    fields,
+                    XAddOptions.noTrim()
             );
         } catch (Exception e) {
             LOG.error("Failed to enqueue callback: {}", e.getMessage());
