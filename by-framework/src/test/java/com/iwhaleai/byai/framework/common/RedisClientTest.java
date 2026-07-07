@@ -1,13 +1,59 @@
 package com.iwhaleai.byai.framework.common;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedConstruction;
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.JedisCluster;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mockConstruction;
 
 /**
  * Tests for RedisClient singleton pattern and resource management.
  */
 class RedisClientTest {
+
+    @AfterEach
+    void clearKeySchemaVersionProperty() {
+        System.clearProperty("REDIS_KEY_SCHEMA_VERSION");
+    }
+
+    @Test
+    void clusterModeRequiresV2SchemaFailsFastWithoutConnecting() {
+        RedisConnectionConfig config = new RedisConnectionConfig();
+        config.setMode(RedisConnectionConfig.Mode.CLUSTER);
+        config.setClusterNodes(List.of(new HostAndPort("unreachable-host", 6379)));
+
+        assertThrows(IllegalStateException.class, () -> new RedisClient(config));
+    }
+
+    @Test
+    void clusterModeWithV2SchemaBuildsClusterClientWithoutFailingFast() {
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v2");
+        RedisConnectionConfig config = new RedisConnectionConfig();
+        config.setMode(RedisConnectionConfig.Mode.CLUSTER);
+        config.setClusterNodes(List.of(
+                new HostAndPort("h1", 6379), new HostAndPort("h2", 6380)));
+
+        List<Object> capturedArgs = new ArrayList<>();
+        try (MockedConstruction<JedisCluster> mocked = mockConstruction(JedisCluster.class,
+                (mock, context) -> capturedArgs.addAll(context.arguments()))) {
+            RedisClient client = new RedisClient(config);
+
+            assertEquals(1, mocked.constructed().size());
+            assertNotNull(client.getCommands());
+            assertSame(mocked.constructed().get(0), client.getCommands());
+
+            @SuppressWarnings("unchecked")
+            Set<HostAndPort> nodesArg = (Set<HostAndPort>) capturedArgs.get(0);
+            assertEquals(Set.of(new HostAndPort("h1", 6379), new HostAndPort("h2", 6380)), nodesArg);
+        }
+    }
 
     @Test
     void getInstanceReturnsNonNull() {
