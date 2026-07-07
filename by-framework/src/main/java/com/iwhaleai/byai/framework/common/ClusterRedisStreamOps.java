@@ -3,8 +3,12 @@ package com.iwhaleai.byai.framework.common;
 import lombok.extern.slf4j.Slf4j;
 import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XClaimParams;
+import redis.clients.jedis.params.XPendingParams;
 import redis.clients.jedis.params.XReadGroupParams;
+import redis.clients.jedis.params.XReadParams;
 import redis.clients.jedis.resps.StreamEntry;
+import redis.clients.jedis.resps.StreamPendingEntry;
 
 import java.util.List;
 import java.util.Map;
@@ -48,5 +52,39 @@ public class ClusterRedisStreamOps implements RedisStreamOps {
     @Override
     public void xack(String streamName, String groupName, StreamEntryID id) {
         jedisCluster.xack(streamName, groupName, id);
+    }
+
+    @Override
+    public StreamEntryID xadd(String streamName, Map<String, String> fields, XAddOptions options) {
+        return jedisCluster.xadd(streamName, options.toParams(), fields);
+    }
+
+    @Override
+    public List<StreamPendingEntry> xpendingRange(String streamName, String groupName, int count) {
+        XPendingParams params = XPendingParams.xPendingParams(
+                StreamEntryID.MINIMUM_ID, StreamEntryID.MAXIMUM_ID, count);
+        return jedisCluster.xpending(streamName, groupName, params);
+    }
+
+    @Override
+    public List<StreamEntry> xclaim(
+            String streamName, String groupName, String consumerName, long minIdleTimeMs, StreamEntryID... ids) {
+        return jedisCluster.xclaim(streamName, groupName, consumerName, minIdleTimeMs, XClaimParams.xClaimParams(),
+                ids);
+    }
+
+    @Override
+    public List<Map.Entry<String, List<StreamEntry>>> xread(
+            String streamName, StreamEntryID afterId, int count, Integer blockMs) {
+        XReadParams params = XReadParams.xReadParams().count(count);
+        if (blockMs != null) {
+            params.block(blockMs);
+        }
+        return jedisCluster.xread(params, Map.of(streamName, afterId));
+    }
+
+    @Override
+    public long xdel(String streamName, StreamEntryID... ids) {
+        return jedisCluster.xdel(streamName, ids);
     }
 }
