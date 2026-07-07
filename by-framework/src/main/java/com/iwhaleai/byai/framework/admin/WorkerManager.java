@@ -1,8 +1,12 @@
 package com.iwhaleai.byai.framework.admin;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
@@ -10,7 +14,6 @@ import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import redis.clients.jedis.Jedis;
 
 import java.util.HashMap;
 import java.util.List;
@@ -31,7 +34,7 @@ public class WorkerManager {
     private static final Logger LOG = LoggerFactory.getLogger(WorkerManager.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    private final RedisClient redisClient;
+    private final RedisStreamOps streamOps;
     private final WorkerRegistry registry;
 
     public WorkerManager(RedisClient redisClient) {
@@ -39,7 +42,9 @@ public class WorkerManager {
     }
 
     public WorkerManager(RedisClient redisClient, WorkerRegistry registry) {
-        this.redisClient = redisClient;
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.registry = registry;
     }
 
@@ -189,9 +194,7 @@ public class WorkerManager {
             String json = OBJECT_MAPPER.writeValueAsString(command);
             Map<String, String> fields = new HashMap<>();
             fields.put(Constants.RedisFields.DATA, json);
-            try (Jedis jedis = redisClient.getResource()) {
-                jedis.xadd(streamKey, (redis.clients.jedis.StreamEntryID) null, fields);
-            }
+            streamOps.xadd(streamKey, fields, XAddOptions.noTrim());
         } catch (Exception e) {
             LOG.error("[WorkerManager] Failed to push command to {}: {}", streamKey, e.getMessage());
         }
