@@ -3,12 +3,13 @@ package com.iwhaleai.byai.framework.core;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
 import com.iwhaleai.byai.framework.common.Constants;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.params.SetParams;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -23,7 +24,7 @@ import java.util.Set;
  * Uses Redis sorted sets and hash structures for storage.
  */
 public class WorkerRegistry {
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
     private final Map<String, String> lockTokens = new HashMap<>();
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final int PRESENCE_PAYLOAD_VERSION = 1;
@@ -39,7 +40,13 @@ public class WorkerRegistry {
     }
 
     public WorkerRegistry(RedisClient redisClient) {
-        this.redisClient = redisClient;
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient);
+    }
+
+    public WorkerRegistry(RedisOps redisOps) {
+        this.redisOps = redisOps;
     }
 
     /**
@@ -50,13 +57,11 @@ public class WorkerRegistry {
      * @param agentTypes List of agent types this worker can handle
      */
     public synchronized void registerWorkerMembership(String workerId, List<String> agentTypes) {
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
-            if (agentTypes != null && !agentTypes.isEmpty()) {
-                for (String agentType : agentTypes) {
-                    jedis.sadd(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId), agentType);
-                    jedis.sadd(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
-                }
+        redisOps.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
+        if (agentTypes != null && !agentTypes.isEmpty()) {
+            for (String agentType : agentTypes) {
+                redisOps.sadd(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId), agentType);
+                redisOps.sadd(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
             }
         }
     }
@@ -69,37 +74,35 @@ public class WorkerRegistry {
      * @param leaseTtlSeconds TTL for the lease key in seconds
      */
     public boolean heartbeatWorker(String workerId, int leaseTtlSeconds) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.RegistryKeys.workerOnlineLease(workerId);
-            String token = lockTokens.get(workerId);
-            String current = jedis.get(key);
-            WorkerPresence currentPresence = decodeWorkerPresence(current);
-            long now = System.currentTimeMillis();
+        String key = Constants.RegistryKeys.workerOnlineLease(workerId);
+        String token = lockTokens.get(workerId);
+        String current = redisOps.get(key);
+        WorkerPresence currentPresence = decodeWorkerPresence(current);
+        long now = System.currentTimeMillis();
 
-            if (token != null) {
-                if (current == null) {
-                    String result = jedis.set(
-                            key,
-                            encodeWorkerPresence(token, now, LOCAL_IP),
-                            SetParams.setParams().nx().ex(leaseTtlSeconds));
-                    if (!"OK".equalsIgnoreCase(result)) {
-                        return false;
-                    }
-                } else if (!token.equals(currentPresence.token())) {
+        if (token != null) {
+            if (current == null) {
+                String result = redisOps.set(
+                        key,
+                        encodeWorkerPresence(token, now, LOCAL_IP),
+                        SetParams.setParams().nx().ex(leaseTtlSeconds));
+                if (!"OK".equalsIgnoreCase(result)) {
                     return false;
-                } else {
-                    jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(token, now, LOCAL_IP));
                 }
+            } else if (!token.equals(currentPresence.token())) {
+                return false;
             } else {
-                if (currentPresence.token() != null) {
-                    return false;
-                }
-                jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(null, now, LOCAL_IP));
+                redisOps.setex(key, leaseTtlSeconds, encodeWorkerPresence(token, now, LOCAL_IP));
             }
-
-            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
-            return true;
+        } else {
+            if (currentPresence.token() != null) {
+                return false;
+            }
+            redisOps.setex(key, leaseTtlSeconds, encodeWorkerPresence(null, now, LOCAL_IP));
         }
+
+        redisOps.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
+        return true;
     }
 
     public void heartbeatWorker(String workerId) {
@@ -113,14 +116,12 @@ public class WorkerRegistry {
      * @param workerId Worker ID
      */
     public synchronized void unregisterWorkerMembership(String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            jedis.del(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            jedis.srem(Constants.RegistryKeys.knownWorkers(), workerId);
-            if (agentTypes != null) {
-                for (String agentType : agentTypes) {
-                    jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
-                }
+        Set<String> agentTypes = redisOps.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+        redisOps.del(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+        redisOps.srem(Constants.RegistryKeys.knownWorkers(), workerId);
+        if (agentTypes != null) {
+            for (String agentType : agentTypes) {
+                redisOps.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
             }
         }
     }
@@ -136,15 +137,13 @@ public class WorkerRegistry {
 
     public boolean markWorkerInactive(String workerId, String token) {
         String expected = token != null ? token : lockTokens.get(workerId);
-        try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.RegistryKeys.workerOnlineLease(workerId);
-            WorkerPresence currentPresence = decodeWorkerPresence(jedis.get(key));
-            if (expected != null && !expected.equals(currentPresence.token())) {
-                return false;
-            }
-            jedis.del(key);
-            return true;
+        String key = Constants.RegistryKeys.workerOnlineLease(workerId);
+        WorkerPresence currentPresence = decodeWorkerPresence(redisOps.get(key));
+        if (expected != null && !expected.equals(currentPresence.token())) {
+            return false;
         }
+        redisOps.del(key);
+        return true;
     }
 
     /**
@@ -155,14 +154,12 @@ public class WorkerRegistry {
      * @return true if worker is alive (lease key exists)
      */
     public boolean isWorkerOnline(String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String leaseValue = jedis.get(Constants.RegistryKeys.workerOnlineLease(workerId));
-            if (leaseValue == null) {
-                return false;
-            }
-            WorkerPresence presence = decodeWorkerPresence(leaseValue);
-            return presence.legacy() || presence.lastSeen() > 0;
+        String leaseValue = redisOps.get(Constants.RegistryKeys.workerOnlineLease(workerId));
+        if (leaseValue == null) {
+            return false;
         }
+        WorkerPresence presence = decodeWorkerPresence(leaseValue);
+        return presence.legacy() || presence.lastSeen() > 0;
     }
 
     /**
@@ -172,20 +169,18 @@ public class WorkerRegistry {
      * @return List of online worker IDs
      */
     public List<String> getOnlineWorkers(String agentType) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> workers = jedis.smembers(Constants.RegistryKeys.agentTypeMembers(agentType));
-            if (workers == null || workers.isEmpty()) {
-                return Collections.emptyList();
-            }
-
-            List<String> onlineWorkers = new ArrayList<>();
-            for (String workerId : workers) {
-                if (isWorkerOnline(workerId)) {
-                    onlineWorkers.add(workerId);
-                }
-            }
-            return onlineWorkers;
+        Set<String> workers = redisOps.smembers(Constants.RegistryKeys.agentTypeMembers(agentType));
+        if (workers == null || workers.isEmpty()) {
+            return Collections.emptyList();
         }
+
+        List<String> onlineWorkers = new ArrayList<>();
+        for (String workerId : workers) {
+            if (isWorkerOnline(workerId)) {
+                onlineWorkers.add(workerId);
+            }
+        }
+        return onlineWorkers;
     }
 
     /**
@@ -234,26 +229,24 @@ public class WorkerRegistry {
     }
 
     public OnlineAgentCheckResult hasOnlineAgentType(String agentType, boolean checkActive, long healthThresholdMs) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> workers = jedis.smembers(Constants.RegistryKeys.agentTypeMembers(agentType));
-            if (workers == null || workers.isEmpty()) {
-                return new OnlineAgentCheckResult(false, Collections.emptyList());
-            }
-
-            List<String> workerIds = new ArrayList<>(workers);
-
-            if (checkActive) {
-                List<String> onlineWorkerIds = new ArrayList<>();
-                for (String workerId : workerIds) {
-                    if (isWorkerOnline(workerId)) {
-                        onlineWorkerIds.add(workerId);
-                    }
-                }
-                workerIds = onlineWorkerIds;
-            }
-
-            return new OnlineAgentCheckResult(!workerIds.isEmpty(), workerIds);
+        Set<String> workers = redisOps.smembers(Constants.RegistryKeys.agentTypeMembers(agentType));
+        if (workers == null || workers.isEmpty()) {
+            return new OnlineAgentCheckResult(false, Collections.emptyList());
         }
+
+        List<String> workerIds = new ArrayList<>(workers);
+
+        if (checkActive) {
+            List<String> onlineWorkerIds = new ArrayList<>();
+            for (String workerId : workerIds) {
+                if (isWorkerOnline(workerId)) {
+                    onlineWorkerIds.add(workerId);
+                }
+            }
+            workerIds = onlineWorkerIds;
+        }
+
+        return new OnlineAgentCheckResult(!workerIds.isEmpty(), workerIds);
     }
 
     /**
@@ -267,18 +260,16 @@ public class WorkerRegistry {
     public String claimWorkerId(String workerId, int ttlSeconds) {
         String presenceKey = Constants.RegistryKeys.workerOnlineLease(workerId);
         String token = java.util.UUID.randomUUID().toString();
-        try (Jedis jedis = redisClient.getResource()) {
-            String result = jedis.set(
-                    presenceKey,
-                    encodeWorkerPresence(token, 0, LOCAL_IP),
-                    SetParams.setParams().nx().ex(ttlSeconds));
-            if (!"OK".equalsIgnoreCase(result)) {
-                throw new RuntimeException("worker_id already in use: " + workerId);
-            }
-            lockTokens.put(workerId, token);
-            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
-            return token;
+        String result = redisOps.set(
+                presenceKey,
+                encodeWorkerPresence(token, 0, LOCAL_IP),
+                SetParams.setParams().nx().ex(ttlSeconds));
+        if (!"OK".equalsIgnoreCase(result)) {
+            throw new RuntimeException("worker_id already in use: " + workerId);
         }
+        lockTokens.put(workerId, token);
+        redisOps.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
+        return token;
     }
 
     public String claimWorkerId(String workerId) {
@@ -299,13 +290,11 @@ public class WorkerRegistry {
         }
 
         String presenceKey = Constants.RegistryKeys.workerOnlineLease(workerId);
-        try (Jedis jedis = redisClient.getResource()) {
-            WorkerPresence presence = decodeWorkerPresence(jedis.get(presenceKey));
-            if (token.equals(presence.token())) {
-                return jedis.expire(presenceKey, ttlSeconds) > 0;
-            }
-            return false;
+        WorkerPresence presence = decodeWorkerPresence(redisOps.get(presenceKey));
+        if (token.equals(presence.token())) {
+            return redisOps.expire(presenceKey, ttlSeconds) > 0;
         }
+        return false;
     }
 
     public boolean refreshWorkerIdLock(String workerId) {
@@ -326,54 +315,52 @@ public class WorkerRegistry {
         }
 
         String presenceKey = Constants.RegistryKeys.workerOnlineLease(workerId);
-        try (Jedis jedis = redisClient.getResource()) {
-            WorkerPresence presence = decodeWorkerPresence(jedis.get(presenceKey));
-            if (expected.equals(presence.token())) {
-                jedis.del(presenceKey);
-                lockTokens.remove(workerId);
-                return true;
-            }
-            return false;
+        WorkerPresence presence = decodeWorkerPresence(redisOps.get(presenceKey));
+        if (expected.equals(presence.token())) {
+            redisOps.del(presenceKey);
+            lockTokens.remove(workerId);
+            return true;
         }
+        return false;
     }
 
     public Map<String, Object> getWorker(String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String rawPresence = jedis.get(Constants.RegistryKeys.workerOnlineLease(workerId));
-            if (rawPresence == null) {
-                return null;
-            }
-            WorkerPresence presence = decodeWorkerPresence(rawPresence);
-            if (!presence.legacy() && presence.lastSeen() <= 0) {
-                return null;
-            }
-
-            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            Map<String, Object> result = new HashMap<>();
-            result.put("agent_types", agentTypes);
-            result.put("last_seen", presence.legacy() ? System.currentTimeMillis() : presence.lastSeen());
-            result.put("ip_address", presence.ipAddress());
-            return result;
+        String rawPresence = redisOps.get(Constants.RegistryKeys.workerOnlineLease(workerId));
+        if (rawPresence == null) {
+            return null;
         }
+        WorkerPresence presence = decodeWorkerPresence(rawPresence);
+        if (!presence.legacy() && presence.lastSeen() <= 0) {
+            return null;
+        }
+
+        Set<String> agentTypes = redisOps.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+        Map<String, Object> result = new HashMap<>();
+        result.put("agent_types", agentTypes);
+        result.put("last_seen", presence.legacy() ? System.currentTimeMillis() : presence.lastSeen());
+        result.put("ip_address", presence.ipAddress());
+        return result;
     }
 
     public Map<String, Map<String, Object>> getAllWorkers() {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> workerIds = jedis.smembers(Constants.RegistryKeys.knownWorkers());
-            Map<String, Map<String, Object>> result = new HashMap<>();
-            if (workerIds != null) {
-                for (String id : workerIds) {
-                    Map<String, Object> data = getWorker(id);
-                    if (data != null) {
-                        Map<String, String> adminState = getWorkerAdminState(id);
-                        data.put("lifecycle", adminState.getOrDefault("lifecycle", "active"));
-                        data.put("lifecycle_reason", adminState.getOrDefault("reason", ""));
-                        result.put(id, data);
-                    }
-                }
-            }
+        Set<String> workerIds = redisOps.smembers(Constants.RegistryKeys.knownWorkers());
+        Map<String, Map<String, Object>> result = new HashMap<>();
+        if (workerIds == null || workerIds.isEmpty()) {
             return result;
         }
+
+        List<String> idList = new ArrayList<>(workerIds);
+        Map<String, Map<String, String>> adminStates = redisOps.batchGetWorkerAdminStates(idList);
+        for (String id : idList) {
+            Map<String, Object> data = getWorker(id);
+            if (data != null) {
+                Map<String, String> adminState = adminStates.getOrDefault(id, Map.of());
+                data.put("lifecycle", adminState.getOrDefault("lifecycle", "active"));
+                data.put("lifecycle_reason", adminState.getOrDefault("reason", ""));
+                result.put(id, data);
+            }
+        }
+        return result;
     }
 
     /**
@@ -384,13 +371,8 @@ public class WorkerRegistry {
      * @param reason    Human-readable reason for the state change
      */
     public synchronized void setWorkerAdminState(String workerId, String lifecycle, String reason) {
-        String key = Constants.RegistryKeys.workerAdminState(workerId);
         long now = System.currentTimeMillis();
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.hset(key, "lifecycle", lifecycle);
-            jedis.hset(key, "reason", reason != null ? reason : "");
-            jedis.hset(key, "updated_at", String.valueOf(now));
-        }
+        redisOps.updateWorkerAdminState(workerId, lifecycle, reason, now);
     }
 
     /**
@@ -401,10 +383,8 @@ public class WorkerRegistry {
      */
     public Map<String, String> getWorkerAdminState(String workerId) {
         String key = Constants.RegistryKeys.workerAdminState(workerId);
-        try (Jedis jedis = redisClient.getResource()) {
-            Map<String, String> raw = jedis.hgetAll(key);
-            return raw != null ? raw : new HashMap<>();
-        }
+        Map<String, String> raw = redisOps.hgetAll(key);
+        return raw != null ? raw : new HashMap<>();
     }
 
     /**
@@ -413,10 +393,7 @@ public class WorkerRegistry {
      * @param workerId Worker ID
      */
     public synchronized void clearWorkerAdminState(String workerId) {
-        String key = Constants.RegistryKeys.workerAdminState(workerId);
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.del(key);
-        }
+        redisOps.del(Constants.RegistryKeys.workerAdminState(workerId));
     }
 
     /**
@@ -427,12 +404,10 @@ public class WorkerRegistry {
      * @param workerId Worker ID
      */
     public synchronized void removeWorkerFromTypeMembers(String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            if (agentTypes != null) {
-                for (String agentType : agentTypes) {
-                    jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
-                }
+        Set<String> agentTypes = redisOps.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+        if (agentTypes != null) {
+            for (String agentType : agentTypes) {
+                redisOps.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
             }
         }
     }
@@ -445,13 +420,11 @@ public class WorkerRegistry {
      * @param workerId Worker ID
      */
     public synchronized void restoreWorkerToTypeMembers(String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            if (agentTypes != null) {
-                for (String agentType : agentTypes) {
-                    if (!isWorkerDeniedForType(agentType, workerId)) {
-                        jedis.sadd(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
-                    }
+        Set<String> agentTypes = redisOps.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
+        if (agentTypes != null) {
+            for (String agentType : agentTypes) {
+                if (!isWorkerDeniedForType(agentType, workerId)) {
+                    redisOps.sadd(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
                 }
             }
         }
@@ -465,10 +438,8 @@ public class WorkerRegistry {
      * @param workerId  Worker ID
      */
     public synchronized void denyWorkerForType(String agentType, String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.sadd(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
-            jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
-        }
+        redisOps.sadd(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
+        redisOps.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
     }
 
     /**
@@ -478,9 +449,7 @@ public class WorkerRegistry {
      * @param workerId  Worker ID
      */
     public synchronized void allowWorkerForType(String agentType, String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.srem(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
-        }
+        redisOps.srem(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
     }
 
     /**
@@ -491,9 +460,7 @@ public class WorkerRegistry {
      * @return true if denied
      */
     public boolean isWorkerDeniedForType(String agentType, String workerId) {
-        try (Jedis jedis = redisClient.getResource()) {
-            return jedis.sismember(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
-        }
+        return redisOps.sismember(Constants.RegistryKeys.agentTypeDenied(agentType), workerId);
     }
 
     /**
@@ -503,10 +470,8 @@ public class WorkerRegistry {
      * @return List of denied worker IDs
      */
     public List<String> getAgentTypeDenylist(String agentType) {
-        try (Jedis jedis = redisClient.getResource()) {
-            Set<String> members = jedis.smembers(Constants.RegistryKeys.agentTypeDenied(agentType));
-            return members != null ? new ArrayList<>(members) : Collections.emptyList();
-        }
+        Set<String> members = redisOps.smembers(Constants.RegistryKeys.agentTypeDenied(agentType));
+        return members != null ? new ArrayList<>(members) : Collections.emptyList();
     }
 
     private static String encodeWorkerPresence(String token, long lastSeen, String ipAddress) {
@@ -563,7 +528,6 @@ public class WorkerRegistry {
         String messageId = String.valueOf(execution.get(Constants.ExecutionFields.MESSAGE_ID));
         String sessionId = String.valueOf(execution.get(Constants.ExecutionFields.SESSION_ID));
 
-        String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
         String encodedData;
         try {
             encodedData = OBJECT_MAPPER.writeValueAsString(execution);
@@ -571,14 +535,10 @@ public class WorkerRegistry {
             throw new RuntimeException("Failed to serialize execution", e);
         }
 
-        try (Jedis jedis = redisClient.getResource()) {
-            try (Pipeline pipe = jedis.pipelined()) {
-                pipe.hset(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId, encodedData);
-                pipe.hset(regKey, Constants.RegistryFields.MSG_MAP_PREFIX + messageId, executionId);
-                pipe.expire(regKey, Constants.DEFAULT_SESSION_TTL);
-                pipe.sync();
-            }
-        }
+        Map<String, String> fields = new HashMap<>();
+        fields.put(Constants.RegistryFields.EXEC_PREFIX + executionId, encodedData);
+        fields.put(Constants.RegistryFields.MSG_MAP_PREFIX + messageId, executionId);
+        redisOps.saveSessionExecution(sessionId, fields, Constants.DEFAULT_SESSION_TTL);
     }
 
     public synchronized Map<String, Object> getExecution(String executionId, String sessionId) {
@@ -587,16 +547,14 @@ public class WorkerRegistry {
         }
 
         String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            String data = jedis.hget(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId);
-            if (data == null || data.isEmpty()) {
-                return null;
-            }
-            try {
-                return OBJECT_MAPPER.readValue(data, MAP_TYPE_REF);
-            } catch (JsonProcessingException e) {
-                throw new RuntimeException("Failed to deserialize execution", e);
-            }
+        String data = redisOps.hget(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId);
+        if (data == null || data.isEmpty()) {
+            return null;
+        }
+        try {
+            return OBJECT_MAPPER.readValue(data, MAP_TYPE_REF);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to deserialize execution", e);
         }
     }
 
@@ -606,13 +564,11 @@ public class WorkerRegistry {
         }
 
         String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            String executionId = jedis.hget(regKey, Constants.RegistryFields.MSG_MAP_PREFIX + messageId);
-            if (executionId == null || executionId.isEmpty()) {
-                return null;
-            }
-            return getExecution(executionId, sessionId);
+        String executionId = redisOps.hget(regKey, Constants.RegistryFields.MSG_MAP_PREFIX + messageId);
+        if (executionId == null || executionId.isEmpty()) {
+            return null;
         }
+        return getExecution(executionId, sessionId);
     }
 
     /**
@@ -699,16 +655,7 @@ public class WorkerRegistry {
         timeline.add(entry);
         current.put("timeline", timeline);
 
-        String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            try (Pipeline pipe = jedis.pipelined()) {
-                pipe.hset(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId, OBJECT_MAPPER.writeValueAsString(current));
-                pipe.expire(regKey, Constants.DEFAULT_SESSION_TTL);
-                pipe.sync();
-            } catch (JsonProcessingException e) {
-                throw new RuntimeException("Failed to serialize execution", e);
-            }
-        }
+        writeExecutionSnapshot(executionId, sessionId, current);
     }
 
     public void updateExecutionStatus(String executionId, String sessionId, String status) {
@@ -753,16 +700,7 @@ public class WorkerRegistry {
         }
         current.put(Constants.ExecutionFields.UPDATED_AT, System.currentTimeMillis());
 
-        String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            try (Pipeline pipe = jedis.pipelined()) {
-                pipe.hset(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId, OBJECT_MAPPER.writeValueAsString(current));
-                pipe.expire(regKey, Constants.DEFAULT_SESSION_TTL);
-                pipe.sync();
-            } catch (JsonProcessingException e) {
-                throw new RuntimeException("Failed to serialize execution", e);
-            }
-        }
+        writeExecutionSnapshot(executionId, sessionId, current);
     }
 
     /**
@@ -780,21 +718,19 @@ public class WorkerRegistry {
         String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
         Map<String, Map<String, Object>> result = new HashMap<>();
 
-        try (Jedis jedis = redisClient.getResource()) {
-            Map<String, String> allFields = jedis.hgetAll(regKey);
-            if (allFields == null) {
-                return result;
-            }
+        Map<String, String> allFields = redisOps.hgetAll(regKey);
+        if (allFields == null) {
+            return result;
+        }
 
-            for (Map.Entry<String, String> entry : allFields.entrySet()) {
-                if (entry.getKey().startsWith(Constants.RegistryFields.EXEC_PREFIX)) {
-                    try {
-                        Map<String, Object> execData = OBJECT_MAPPER.readValue(entry.getValue(), MAP_TYPE_REF);
-                        String execId = entry.getKey().substring(Constants.RegistryFields.EXEC_PREFIX.length());
-                        result.put(execId, execData);
-                    } catch (JsonProcessingException e) {
-                        // skip malformed entries
-                    }
+        for (Map.Entry<String, String> entry : allFields.entrySet()) {
+            if (entry.getKey().startsWith(Constants.RegistryFields.EXEC_PREFIX)) {
+                try {
+                    Map<String, Object> execData = OBJECT_MAPPER.readValue(entry.getValue(), MAP_TYPE_REF);
+                    String execId = entry.getKey().substring(Constants.RegistryFields.EXEC_PREFIX.length());
+                    result.put(execId, execData);
+                } catch (JsonProcessingException e) {
+                    // skip malformed entries
                 }
             }
         }
@@ -813,16 +749,7 @@ public class WorkerRegistry {
         current.put(Constants.ExecutionFields.CANCEL_REASON, reason);
         current.put(Constants.ExecutionFields.UPDATED_AT, System.currentTimeMillis());
 
-        String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            try (Pipeline pipe = jedis.pipelined()) {
-                pipe.hset(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId, OBJECT_MAPPER.writeValueAsString(current));
-                pipe.expire(regKey, Constants.DEFAULT_SESSION_TTL);
-                pipe.sync();
-            } catch (JsonProcessingException e) {
-                throw new RuntimeException("Failed to serialize execution", e);
-            }
-        }
+        writeExecutionSnapshot(executionId, sessionId, current);
     }
 
     public synchronized void markExecutionFinished(String executionId, String sessionId, String status) {
@@ -836,15 +763,18 @@ public class WorkerRegistry {
         current.put(Constants.ExecutionFields.FINISHED_AT, now);
         current.put(Constants.ExecutionFields.UPDATED_AT, now);
 
-        String regKey = Constants.RegistryKeys.sessionRegistry(sessionId);
-        try (Jedis jedis = redisClient.getResource()) {
-            try (Pipeline pipe = jedis.pipelined()) {
-                pipe.hset(regKey, Constants.RegistryFields.EXEC_PREFIX + executionId, OBJECT_MAPPER.writeValueAsString(current));
-                pipe.expire(regKey, Constants.DEFAULT_SESSION_TTL);
-                pipe.sync();
-            } catch (JsonProcessingException e) {
-                throw new RuntimeException("Failed to serialize execution", e);
-            }
+        writeExecutionSnapshot(executionId, sessionId, current);
+    }
+
+    private void writeExecutionSnapshot(String executionId, String sessionId, Map<String, Object> execution) {
+        try {
+            String encoded = OBJECT_MAPPER.writeValueAsString(execution);
+            redisOps.saveSessionExecution(
+                    sessionId,
+                    Map.of(Constants.RegistryFields.EXEC_PREFIX + executionId, encoded),
+                    Constants.DEFAULT_SESSION_TTL);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize execution", e);
         }
     }
 }
