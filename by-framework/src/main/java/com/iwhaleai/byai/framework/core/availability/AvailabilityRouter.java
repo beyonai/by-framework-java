@@ -1,13 +1,18 @@
 package com.iwhaleai.byai.framework.core.availability;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
 import redis.clients.jedis.StreamEntryID;
-import redis.clients.jedis.params.XReadParams;
 import redis.clients.jedis.resps.StreamEntry;
 
 import java.util.List;
@@ -29,7 +34,8 @@ public class AvailabilityRouter {
     private static final int CIRCUIT_BREAKER_WINDOW_SECONDS = 60;
     private static final int QUOTA_DEFAULT_LIMIT = 1000;
 
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
+    private final RedisStreamOps streamOps;
     private final WorkerRegistry workerRegistry;
     private final int defaultTimeoutMs;
     private final int circuitBreakerThreshold;
@@ -47,7 +53,12 @@ public class AvailabilityRouter {
 
     public AvailabilityRouter(RedisClient redisClient, WorkerRegistry workerRegistry,
                               int defaultTimeoutMs, int circuitBreakerThreshold, int quotaDefaultLimit) {
-        this.redisClient = redisClient;
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient);
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.workerRegistry = workerRegistry;
         this.defaultTimeoutMs = defaultTimeoutMs;
         this.circuitBreakerThreshold = circuitBreakerThreshold;
@@ -248,8 +259,8 @@ public class AvailabilityRouter {
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> readJsonKey(String key) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String raw = jedis.get(key);
+        try {
+            String raw = redisOps.get(key);
             if (raw == null || raw.isEmpty()) {
                 return null;
             }
@@ -286,18 +297,16 @@ public class AvailabilityRouter {
         }
 
         // 2. Fallback: check SDK-local failure count key
-        try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
-            String value = jedis.get(key);
-            if (value == null) {
-                return false;
-            }
-            try {
-                int failures = Integer.parseInt(value);
-                return failures >= circuitBreakerThreshold;
-            } catch (NumberFormatException e) {
-                return false;
-            }
+        String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
+        String value = redisOps.get(key);
+        if (value == null) {
+            return false;
+        }
+        try {
+            int failures = Integer.parseInt(value);
+            return failures >= circuitBreakerThreshold;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 
@@ -305,11 +314,9 @@ public class AvailabilityRouter {
      * Record a failure for circuit breaker tracking.
      */
     public void recordFailure(String agentType) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
-            jedis.incr(key);
-            jedis.expire(key, CIRCUIT_BREAKER_WINDOW_SECONDS);
-        }
+        String key = Constants.QueueNames.controlPlaneCircuitBreakerKey(agentType) + ":local";
+        redisOps.incr(key);
+        redisOps.expire(key, CIRCUIT_BREAKER_WINDOW_SECONDS);
     }
 
     // ---- Quota ----
@@ -322,18 +329,16 @@ public class AvailabilityRouter {
         }
 
         // 2. Fallback: check SDK-local quota key
-        try (Jedis jedis = redisClient.getResource()) {
-            String key = Constants.QueueNames.controlPlaneQuotaKey(tenantId) + ":local";
-            String value = jedis.get(key);
-            if (value == null) {
-                return false;
-            }
-            try {
-                int used = Integer.parseInt(value);
-                return used >= quotaDefaultLimit;
-            } catch (NumberFormatException e) {
-                return false;
-            }
+        String key = Constants.QueueNames.controlPlaneQuotaKey(tenantId) + ":local";
+        String value = redisOps.get(key);
+        if (value == null) {
+            return false;
+        }
+        try {
+            int used = Integer.parseInt(value);
+            return used >= quotaDefaultLimit;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 
@@ -382,36 +387,34 @@ public class AvailabilityRouter {
     // ---- Wakeup ----
 
     void emitWakeup(DeliveryIntent intent) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String managementStream = Constants.QueueNames.controlPlaneManagementStream();
+        String managementStream = Constants.QueueNames.controlPlaneManagementStream();
 
-            int priority = 0;
-            if (intent.getPriority() != null) {
-                try {
-                    priority = Integer.parseInt(intent.getPriority());
-                } catch (NumberFormatException ignored) {
-                }
+        int priority = 0;
+        if (intent.getPriority() != null) {
+            try {
+                priority = Integer.parseInt(intent.getPriority());
+            } catch (NumberFormatException ignored) {
             }
-
-            WakeupRequest request = WakeupRequest.builder()
-                    .executionId(intent.getExecutionId())
-                    .targetAgentType(intent.getTargetAgentType())
-                    .sessionId(intent.getSessionId())
-                    .traceId(intent.getTraceId())
-                    .messageId(intent.getMessageId())
-                    .source(intent.getSource() != null ? intent.getSource() : "client")
-                    .policy(intent.getPolicy())
-                    .timeoutMs(intent.getTimeoutMs())
-                    .userCode(intent.getUserCode())
-                    .region(intent.getRegion())
-                    .priority(priority)
-                    .metadata(intent.getMetadata())
-                    .commandPayload(intent.getCommandPayload())
-                    .build();
-
-            jedis.xadd(managementStream, (StreamEntryID) null, request.toRedisPayload());
-            log.info("Emitted wakeup for agent_type='{}' execution_id={}", intent.getTargetAgentType(), intent.getExecutionId());
         }
+
+        WakeupRequest request = WakeupRequest.builder()
+                .executionId(intent.getExecutionId())
+                .targetAgentType(intent.getTargetAgentType())
+                .sessionId(intent.getSessionId())
+                .traceId(intent.getTraceId())
+                .messageId(intent.getMessageId())
+                .source(intent.getSource() != null ? intent.getSource() : "client")
+                .policy(intent.getPolicy())
+                .timeoutMs(intent.getTimeoutMs())
+                .userCode(intent.getUserCode())
+                .region(intent.getRegion())
+                .priority(priority)
+                .metadata(intent.getMetadata())
+                .commandPayload(intent.getCommandPayload())
+                .build();
+
+        streamOps.xadd(managementStream, request.toRedisPayload(), XAddOptions.noTrim());
+        log.info("Emitted wakeup for agent_type='{}' execution_id={}", intent.getTargetAgentType(), intent.getExecutionId());
     }
 
     /**
@@ -433,7 +436,7 @@ public class AvailabilityRouter {
         StreamEntryID lastId = new StreamEntryID("0-0");
 
         while (System.currentTimeMillis() < deadline) {
-            try (Jedis jedis = redisClient.getResource()) {
+            try {
                 long remaining = deadline - System.currentTimeMillis();
                 if (remaining <= 0) {
                     break;
@@ -441,11 +444,8 @@ public class AvailabilityRouter {
 
                 int blockMs = (int) Math.min(remaining, 2000);
 
-                XReadParams xReadParams = XReadParams.xReadParams().count(1).block(blockMs);
-                Map<String, StreamEntryID> streamMap = Map.of(decisionStream, lastId);
-
                 List<Map.Entry<String, List<StreamEntry>>> results =
-                        jedis.xread(xReadParams, streamMap);
+                        streamOps.xread(decisionStream, lastId, 1, blockMs);
 
                 if (results != null && !results.isEmpty()) {
                     for (Map.Entry<String, List<StreamEntry>> result : results) {
@@ -454,7 +454,7 @@ public class AvailabilityRouter {
                             // Advance past consumed entries
                             lastId = entry.getID();
                             // Clean up the consumed entry
-                            jedis.xdel(decisionStream, entry.getID());
+                            streamOps.xdel(decisionStream, entry.getID());
 
                             WakeupDecision decision = WakeupDecision.fromDict(fields);
 
@@ -488,37 +488,35 @@ public class AvailabilityRouter {
     // ---- Pending delivery queue ----
 
     void queuePendingDelivery(DeliveryIntent intent) {
-        try (Jedis jedis = redisClient.getResource()) {
-            String pendingQueue = Constants.QueueNames.controlPlanePendingQueue();
+        String pendingQueue = Constants.QueueNames.controlPlanePendingQueue();
 
-            int priority = 0;
-            if (intent.getPriority() != null) {
-                try {
-                    priority = Integer.parseInt(intent.getPriority());
-                } catch (NumberFormatException ignored) { }
-            }
-
-            PendingDelivery pending = PendingDelivery.builder()
-                    .executionId(intent.getExecutionId())
-                    .messageId(intent.getMessageId())
-                    .sessionId(intent.getSessionId())
-                    .traceId(intent.getTraceId())
-                    .source(intent.getSource())
-                    .targetAgentType(intent.getTargetAgentType())
-                    .deliveryStream(Constants.QueueNames.ctrlStream(intent.getTargetAgentType()))
-                    .userCode(intent.getUserCode())
-                    .region(intent.getRegion())
-                    .priority(priority)
-                    .policy(intent.getPolicy())
-                    .queuedAt(System.currentTimeMillis())
-                    .timeoutMs(intent.getTimeoutMs())
-                    .commandPayload(intent.getCommandPayload())
-                    .metadata(intent.getMetadata())
-                    .build();
-
-            jedis.xadd(pendingQueue, (StreamEntryID) null, pending.toRedisPayload());
-            log.info("Queued pending delivery for agent_type='{}' execution_id={}", intent.getTargetAgentType(), intent.getExecutionId());
+        int priority = 0;
+        if (intent.getPriority() != null) {
+            try {
+                priority = Integer.parseInt(intent.getPriority());
+            } catch (NumberFormatException ignored) { }
         }
+
+        PendingDelivery pending = PendingDelivery.builder()
+                .executionId(intent.getExecutionId())
+                .messageId(intent.getMessageId())
+                .sessionId(intent.getSessionId())
+                .traceId(intent.getTraceId())
+                .source(intent.getSource())
+                .targetAgentType(intent.getTargetAgentType())
+                .deliveryStream(Constants.QueueNames.ctrlStream(intent.getTargetAgentType()))
+                .userCode(intent.getUserCode())
+                .region(intent.getRegion())
+                .priority(priority)
+                .policy(intent.getPolicy())
+                .queuedAt(System.currentTimeMillis())
+                .timeoutMs(intent.getTimeoutMs())
+                .commandPayload(intent.getCommandPayload())
+                .metadata(intent.getMetadata())
+                .build();
+
+        streamOps.xadd(pendingQueue, pending.toRedisPayload(), XAddOptions.noTrim());
+        log.info("Queued pending delivery for agent_type='{}' execution_id={}", intent.getTargetAgentType(), intent.getExecutionId());
     }
 
     // Expose for testing
