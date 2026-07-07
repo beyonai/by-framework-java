@@ -7,13 +7,18 @@ import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.StreamEntryID;
 import redis.clients.jedis.params.SetParams;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -163,5 +168,57 @@ class WorkerRunnerTest {
         assertDoesNotThrow(() -> runner.start());
 
         runner.stop();
+    }
+
+    @Test
+    void runnerStartsTwoIndependentLoopThreads() throws InterruptedException {
+        SimpleWorker worker = new SimpleWorker("w-split", redisClient);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(jedis.set(anyString(), anyString(), any(SetParams.class))).thenReturn("OK");
+        when(jedis.xgroupCreate(anyString(), anyString(), any(), anyBoolean())).thenReturn("OK");
+        lenient().when(jedis.xreadGroup(anyString(), anyString(), any(), anyMap())).thenReturn(null);
+
+        runner.start();
+        Thread.sleep(100);
+        Set<String> names = Thread.getAllStackTraces().keySet().stream()
+                .map(Thread::getName)
+                .collect(Collectors.toSet());
+        runner.stop();
+
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("runner-loop-w-split")));
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("runner-worker-ctrl-loop-w-split")));
+    }
+
+    @Test
+    void agentTypeAndWorkerCtrlStreamsAreReadIndependently() throws InterruptedException {
+        SimpleWorker worker = new SimpleWorker("w-split2", redisClient);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(jedis.set(anyString(), anyString(), any(SetParams.class))).thenReturn("OK");
+        when(jedis.xgroupCreate(anyString(), anyString(), any(), anyBoolean())).thenReturn("OK");
+        when(jedis.xreadGroup(anyString(), anyString(), any(), anyMap())).thenReturn(null);
+
+        runner.start();
+        Thread.sleep(200);
+        runner.stop();
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, StreamEntryID>> streamsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis, atLeastOnce()).xreadGroup(anyString(), anyString(), any(), streamsCaptor.capture());
+
+        String agentTypeStream = Constants.QueueNames.ctrlStream("simple-agent");
+        String workerCtrlStream = Constants.QueueNames.workerCtrlStream("w-split2");
+
+        boolean sawAgentTypeOnly = streamsCaptor.getAllValues().stream()
+                .anyMatch(m -> m.size() == 1 && m.containsKey(agentTypeStream));
+        boolean sawWorkerCtrlOnly = streamsCaptor.getAllValues().stream()
+                .anyMatch(m -> m.size() == 1 && m.containsKey(workerCtrlStream));
+        boolean sawCombined = streamsCaptor.getAllValues().stream()
+                .anyMatch(m -> m.containsKey(agentTypeStream) && m.containsKey(workerCtrlStream));
+
+        assertTrue(sawAgentTypeOnly, "expected a read call scoped only to the agent_type stream");
+        assertTrue(sawWorkerCtrlOnly, "expected a read call scoped only to the workerCtrlStream");
+        assertFalse(sawCombined, "agent_type and worker-ctrl streams must never be read in the same call");
     }
 }
