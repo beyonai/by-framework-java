@@ -97,7 +97,7 @@ public class ServiceRegistry {
                     instanceId
             );
             // 3. 将服务名加入全局索引
-            jedis.sadd(Constants.RegistryKeys.SD_SERVICES, serviceName);
+            jedis.sadd(Constants.RegistryKeys.sdServices(), serviceName);
         }
 
         // 3. 立即触发首次心跳并启动循环（如果间隔 > 0）

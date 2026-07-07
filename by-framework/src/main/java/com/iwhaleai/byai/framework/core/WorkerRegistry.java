@@ -51,7 +51,7 @@ public class WorkerRegistry {
      */
     public synchronized void registerWorkerMembership(String workerId, List<String> agentTypes) {
         try (Jedis jedis = redisClient.getResource()) {
-            jedis.sadd(Constants.RegistryKeys.KNOWN_WORKERS, workerId);
+            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
             if (agentTypes != null && !agentTypes.isEmpty()) {
                 for (String agentType : agentTypes) {
                     jedis.sadd(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId), agentType);
@@ -97,7 +97,7 @@ public class WorkerRegistry {
                 jedis.setex(key, leaseTtlSeconds, encodeWorkerPresence(null, now, LOCAL_IP));
             }
 
-            jedis.sadd(Constants.RegistryKeys.KNOWN_WORKERS, workerId);
+            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
             return true;
         }
     }
@@ -116,7 +116,7 @@ public class WorkerRegistry {
         try (Jedis jedis = redisClient.getResource()) {
             Set<String> agentTypes = jedis.smembers(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
             jedis.del(Constants.RegistryKeys.workerDeclaredAgentTypes(workerId));
-            jedis.srem(Constants.RegistryKeys.KNOWN_WORKERS, workerId);
+            jedis.srem(Constants.RegistryKeys.knownWorkers(), workerId);
             if (agentTypes != null) {
                 for (String agentType : agentTypes) {
                     jedis.srem(Constants.RegistryKeys.agentTypeMembers(agentType), workerId);
@@ -276,7 +276,7 @@ public class WorkerRegistry {
                 throw new RuntimeException("worker_id already in use: " + workerId);
             }
             lockTokens.put(workerId, token);
-            jedis.sadd(Constants.RegistryKeys.KNOWN_WORKERS, workerId);
+            jedis.sadd(Constants.RegistryKeys.knownWorkers(), workerId);
             return token;
         }
     }
@@ -359,7 +359,7 @@ public class WorkerRegistry {
 
     public Map<String, Map<String, Object>> getAllWorkers() {
         try (Jedis jedis = redisClient.getResource()) {
-            Set<String> workerIds = jedis.smembers(Constants.RegistryKeys.KNOWN_WORKERS);
+            Set<String> workerIds = jedis.smembers(Constants.RegistryKeys.knownWorkers());
             Map<String, Map<String, Object>> result = new HashMap<>();
             if (workerIds != null) {
                 for (String id : workerIds) {
