@@ -1,7 +1,10 @@
 package com.iwhaleai.byai.framework.worker;
 
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
 import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
@@ -41,12 +44,14 @@ public class WorkerRunner {
 
     private final GatewayWorker worker;
     private final RedisClient redisClient;
+    private final RedisStreamOps streamOps;
     private final String groupName;
     private final String consumerName;
     private final ExecutorService taskExecutor;
     private final ConcurrentHashMap<String, Thread> activeExecutions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> messageToExecution = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean evictionHandled = new AtomicBoolean(false);
     private String lockToken;
 
     // Admin lifecycle state machine
@@ -65,6 +70,9 @@ public class WorkerRunner {
     public WorkerRunner(GatewayWorker worker, RedisClient redisClient, String groupName) {
         this.worker = worker;
         this.redisClient = redisClient;
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.groupName = groupName != null ? groupName : autoGroupName();
         this.consumerName = worker.workerId;
         // Use virtual threads for IO-bound task processing (Java 21+)
@@ -89,22 +97,10 @@ public class WorkerRunner {
     }
 
     private void setupStreams() {
-        try (Jedis jedis = redisClient.getResource()) {
-            for (String agentType : worker.getAgentTypes()) {
-                setupStreamGroup(jedis, Constants.QueueNames.ctrlStream(agentType));
-            }
-            setupStreamGroup(jedis, Constants.QueueNames.workerCtrlStream(worker.workerId));
+        for (String agentType : worker.getAgentTypes()) {
+            streamOps.xgroupCreateIfNotExists(Constants.QueueNames.ctrlStream(agentType), groupName);
         }
-    }
-
-    private void setupStreamGroup(Jedis jedis, String streamName) {
-        try {
-            jedis.xgroupCreate(streamName, groupName, redis.clients.jedis.StreamEntryID.LAST_ENTRY, true);
-        } catch (Exception e) {
-            if (!e.getMessage().contains("BUSYGROUP")) {
-                LOG.warn("Warning setting up stream {}: {}", streamName, e.getMessage());
-            }
-        }
+        streamOps.xgroupCreateIfNotExists(Constants.QueueNames.workerCtrlStream(worker.workerId), groupName);
     }
 
     public void start() {
@@ -151,10 +147,19 @@ public class WorkerRunner {
 
         LOG.info("[{}] Runner started, waiting for tasks...", worker.workerId);
 
-        new Thread(this::runLoop, "runner-loop-" + worker.workerId).start();
+        new Thread(this::runAgentTypeLoop, "runner-loop-" + worker.workerId).start();
+        new Thread(this::runWorkerCtrlLoop, "runner-worker-ctrl-loop-" + worker.workerId).start();
     }
 
-    private void runLoop() {
+    /**
+     * Reads every non-denied agent_type ctrl stream, combined into one
+     * xreadGroup() call. Combining multiple agent_type streams together is
+     * itself CROSSSLOT-prone under Cluster (each agent_type is its own,
+     * untagged entity) - that redesign is the main Phase 4 issue's two-phase
+     * scan+block plan, not this prefactor. This loop is only responsible for
+     * no longer also pulling workerCtrlStream(workerId) into the same call.
+     */
+    private void runAgentTypeLoop() {
         while (running.get()) {
             try {
                 lastConsumerTick = System.currentTimeMillis();
@@ -165,7 +170,7 @@ public class WorkerRunner {
                     continue;
                 }
                 if ("evicted".equals(adminLifecycle)) {
-                    LOG.info("[{}] Eviction requested; stopping consumer loop", worker.workerId);
+                    LOG.info("[{}] Eviction requested; stopping agent_type loop", worker.workerId);
                     break;
                 }
 
@@ -177,9 +182,6 @@ public class WorkerRunner {
                                 redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
                     }
                 }
-                // Always include per-worker control stream (for lifecycle commands)
-                streams.put(Constants.QueueNames.workerCtrlStream(worker.workerId),
-                        redis.clients.jedis.StreamEntryID.UNRECEIVED_ENTRY);
 
                 if (streams.isEmpty()) {
                     Thread.sleep(Constants.LOOP_SLEEP_MS);
@@ -206,10 +208,10 @@ public class WorkerRunner {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                LOG.info("Runner loop interrupted, shutting down");
+                LOG.info("Agent_type loop interrupted, shutting down");
                 break;
             } catch (Exception e) {
-                LOG.error("Error in runner loop: {}", e.getMessage());
+                LOG.error("Error in agent_type loop: {}", e.getMessage());
                 try {
                     Thread.sleep(Constants.LOOP_SLEEP_MS);
                 } catch (InterruptedException ex) {
@@ -219,18 +221,75 @@ public class WorkerRunner {
             }
         }
 
-        // Handle post-eviction shutdown
-        if ("evicted".equals(adminLifecycle)) {
-            LOG.info("[{}] Worker evicted (force={}), initiating shutdown", worker.workerId, evictForce);
-            if (evictForce) {
-                // Force: interrupt all active executions immediately
-                for (Thread t : activeExecutions.values()) {
-                    t.interrupt();
+        handlePostEvictionShutdownIfNeeded();
+    }
+
+    /**
+     * Reads only workerCtrlStream(workerId) (direct routing: lifecycle
+     * commands, cancel requests targeted at this worker). Split out of the
+     * combined loop since it belongs to the "worker" hash-tag group, a
+     * different entity than the agent_type streams above - the two must
+     * never share one xreadGroup() call under Cluster.
+     */
+    private void runWorkerCtrlLoop() {
+        String workerCtrlStream = Constants.QueueNames.workerCtrlStream(worker.workerId);
+        while (running.get()) {
+            try {
+                lastConsumerTick = System.currentTimeMillis();
+
+                if ("suspended".equals(adminLifecycle)) {
+                    Thread.sleep(Constants.LOOP_SLEEP_MS);
+                    continue;
+                }
+                if ("evicted".equals(adminLifecycle)) {
+                    LOG.info("[{}] Eviction requested; stopping worker-ctrl loop", worker.workerId);
+                    break;
+                }
+
+                List<Map.Entry<String, List<StreamEntry>>> results = streamOps.xreadGroup(
+                        workerCtrlStream, groupName, consumerName,
+                        Constants.REDIS_READ_BATCH_SIZE, Constants.REDIS_BLOCK_TIMEOUT_MS);
+
+                if (results != null) {
+                    for (Map.Entry<String, List<StreamEntry>> entry : results) {
+                        String streamName = entry.getKey();
+                        for (StreamEntry streamEntry : entry.getValue()) {
+                            processMessageAsync(streamName, streamEntry);
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.info("Worker-ctrl loop interrupted, shutting down");
+                break;
+            } catch (Exception e) {
+                LOG.error("Error in worker-ctrl loop: {}", e.getMessage());
+                try {
+                    Thread.sleep(Constants.LOOP_SLEEP_MS);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
-            // Signal the runner to stop (stop() does the actual cleanup)
-            stop();
         }
+
+        handlePostEvictionShutdownIfNeeded();
+    }
+
+    /** Runs once regardless of which loop observes the eviction first. */
+    private void handlePostEvictionShutdownIfNeeded() {
+        if (!"evicted".equals(adminLifecycle) || !evictionHandled.compareAndSet(false, true)) {
+            return;
+        }
+        LOG.info("[{}] Worker evicted (force={}), initiating shutdown", worker.workerId, evictForce);
+        if (evictForce) {
+            // Force: interrupt all active executions immediately
+            for (Thread t : activeExecutions.values()) {
+                t.interrupt();
+            }
+        }
+        // Signal the runner to stop (stop() does the actual cleanup)
+        stop();
     }
 
     private void processMessageAsync(String streamName, StreamEntry entry) {
@@ -270,9 +329,7 @@ public class WorkerRunner {
                     if (Constants.TERMINAL_STATES.contains(status)) {
                         LOG.info("[{}] Skipping terminal replay: {} -> {}", worker.workerId, header.messageId(),
                                 status);
-                        try (Jedis jedis = redisClient.getResource()) {
-                            jedis.xack(streamName, groupName, entry.getID());
-                        }
+                        streamOps.xack(streamName, groupName, entry.getID());
                         return;
                     }
                 }
@@ -312,9 +369,7 @@ public class WorkerRunner {
                     worker.handleMessage(command, executionId);
 
                     // 7. ACK
-                    try (Jedis jedis = redisClient.getResource()) {
-                        jedis.xack(streamName, groupName, entry.getID());
-                    }
+                    streamOps.xack(streamName, groupName, entry.getID());
                 } finally {
                     activeExecutions.remove(executionId);
                     messageToExecution.remove(header.messageId());
@@ -337,9 +392,7 @@ public class WorkerRunner {
             }
 
             // Acknowledge the control command immediately
-            try (Jedis jedis = redisClient.getResource()) {
-                jedis.xack(streamName, groupName, streamId);
-            }
+            streamOps.xack(streamName, groupName, streamId);
 
             if (targetExecId != null) {
                 worker.registry.markExecutionCancelling(targetExecId, command.header().sessionId(), reason);
@@ -361,9 +414,7 @@ public class WorkerRunner {
             LOG.info("[{}] Worker suspended by admin: {}", worker.workerId,
                     command.body() != null ? command.body().reason() : "");
             adminLifecycle = "suspended";
-            try (Jedis jedis = redisClient.getResource()) {
-                jedis.xack(streamName, groupName, streamId);
-            }
+            streamOps.xack(streamName, groupName, streamId);
         } catch (Exception e) {
             LOG.error("[{}] Error handling SuspendWorkerCommand: {}", worker.workerId, e.getMessage());
         }
@@ -374,9 +425,7 @@ public class WorkerRunner {
         try {
             LOG.info("[{}] Worker resumed by admin", worker.workerId);
             adminLifecycle = "active";
-            try (Jedis jedis = redisClient.getResource()) {
-                jedis.xack(streamName, groupName, streamId);
-            }
+            streamOps.xack(streamName, groupName, streamId);
         } catch (Exception e) {
             LOG.error("[{}] Error handling ResumeWorkerCommand: {}", worker.workerId, e.getMessage());
         }
@@ -390,9 +439,7 @@ public class WorkerRunner {
             LOG.info("[{}] Worker evicted by admin (force={}, reason={})", worker.workerId, force, reason);
             evictForce = force;
             adminLifecycle = "evicted";
-            try (Jedis jedis = redisClient.getResource()) {
-                jedis.xack(streamName, groupName, streamId);
-            }
+            streamOps.xack(streamName, groupName, streamId);
         } catch (Exception e) {
             LOG.error("[{}] Error handling EvictWorkerCommand: {}", worker.workerId, e.getMessage());
         }

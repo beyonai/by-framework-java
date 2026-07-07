@@ -175,6 +175,16 @@ public class RedisClient {
         return jedisCluster != null ? jedisCluster : jedisPool.getResource();
     }
 
+    /**
+     * Raw JedisCluster accessor, null in standalone mode. Unlike getCommands(),
+     * this is typed so callers building a long-lived Cluster-specific adapter
+     * (see ClusterRedisStreamOps) can hold onto it without ever risking a
+     * close() call meant for a pooled, per-borrow Jedis.
+     */
+    public JedisCluster getJedisCluster() {
+        return jedisCluster;
+    }
+
     public void close() {
         if (jedisCluster != null) {
             jedisCluster.close();
