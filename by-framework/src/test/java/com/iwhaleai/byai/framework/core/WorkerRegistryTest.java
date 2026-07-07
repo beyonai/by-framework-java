@@ -29,15 +29,11 @@ class WorkerRegistryTest {
     @Mock
     private Jedis jedis;
 
-    @Mock
-    private redis.clients.jedis.Pipeline pipeline;
-
     private WorkerRegistry registry;
 
     @BeforeEach
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
-        lenient().when(jedis.pipelined()).thenReturn(pipeline);
         registry = new WorkerRegistry(redisClient);
     }
 
@@ -190,11 +186,9 @@ class WorkerRegistryTest {
         registry.saveExecution(execution);
 
         String regKey = Constants.RegistryKeys.sessionRegistry("sess-1");
-        verify(pipeline).hset(eq(regKey), eq("exec:exec-1"), anyString());
-        verify(pipeline).hset(eq(regKey), eq("msg_map:msg-1"), eq("exec-1"));
-        // verify(pipeline).expire(eq(regKey), eq((long)
-        // Constants.DEFAULT_SESSION_TTL));
-        verify(pipeline).sync();
+        verify(jedis).hset(eq(regKey), eq("exec:exec-1"), anyString());
+        verify(jedis).hset(eq(regKey), eq("msg_map:msg-1"), eq("exec-1"));
+        verify(jedis).expire(eq(regKey), eq((long) Constants.DEFAULT_SESSION_TTL));
     }
 
     @Test
@@ -254,7 +248,7 @@ class WorkerRegistryTest {
         registry.markExecutionCancelling("exec-1", "sess-1", "user requested");
 
         ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
-        verify(pipeline).hset(eq(regKey), eq("exec:exec-1"), captor.capture());
+        verify(jedis).hset(eq(regKey), eq("exec:exec-1"), captor.capture());
 
         String updatedJson = captor.getValue();
         assertTrue(updatedJson.contains("\"status\":\"CANCELLING\""));
@@ -268,7 +262,7 @@ class WorkerRegistryTest {
 
         registry.markExecutionCancelling("nonexistent", "sess-1", "reason");
 
-        verify(pipeline, never()).hset(anyString(), anyString(), anyString());
+        verify(jedis, never()).hset(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -280,7 +274,7 @@ class WorkerRegistryTest {
         registry.markExecutionFinished("exec-1", "sess-1", "COMPLETED");
 
         ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
-        verify(pipeline).hset(eq(regKey), eq("exec:exec-1"), captor.capture());
+        verify(jedis).hset(eq(regKey), eq("exec:exec-1"), captor.capture());
 
         String updatedJson = captor.getValue();
         assertTrue(updatedJson.contains("\"status\":\"COMPLETED\""));
@@ -294,7 +288,7 @@ class WorkerRegistryTest {
 
         registry.markExecutionFinished("nonexistent", "sess-1", "COMPLETED");
 
-        verify(pipeline, never()).hset(anyString(), anyString(), anyString());
+        verify(jedis, never()).hset(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -310,7 +304,7 @@ class WorkerRegistryTest {
 
         registry.saveExecution(execution);
         String regKey = Constants.RegistryKeys.sessionRegistry("sess-lifecycle");
-        verify(pipeline).hset(eq(regKey), eq("exec:exec-lifecycle"), anyString());
+        verify(jedis).hset(eq(regKey), eq("exec:exec-lifecycle"), anyString());
 
         // Get by message_id
         when(jedis.hget(regKey, "msg_map:msg-lifecycle")).thenReturn("exec-lifecycle");
@@ -324,7 +318,7 @@ class WorkerRegistryTest {
 
         // Mark cancelling
         registry.markExecutionCancelling("exec-lifecycle", "sess-lifecycle", "timeout");
-        verify(pipeline, atLeastOnce()).hset(eq(regKey), eq("exec:exec-lifecycle"), anyString());
+        verify(jedis, atLeastOnce()).hset(eq(regKey), eq("exec:exec-lifecycle"), anyString());
 
         // Mark finished
         registry.markExecutionFinished("exec-lifecycle", "sess-lifecycle", "CANCELLED");
