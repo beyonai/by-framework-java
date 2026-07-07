@@ -51,7 +51,7 @@ class DiscoveryTest {
 
         verify(jedis).hset(eq(Constants.RegistryKeys.sdInstanceDetails("test-service")), eq(instance.getId()),
                 anyString());
-        verify(jedis).sadd(eq(Constants.RegistryKeys.SD_SERVICES), eq("test-service"));
+        verify(jedis).sadd(eq(Constants.RegistryKeys.sdServices()), eq("test-service"));
         verify(jedis, atLeastOnce()).zadd(eq(Constants.RegistryKeys.sdActiveInstances("test-service")), anyDouble(),
                 eq(instance.getId()));
 

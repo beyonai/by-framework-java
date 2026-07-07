@@ -45,7 +45,7 @@ class WorkerRegistryTest {
     void registerWorkerMembershipAddsToAgentTypeMembers() {
         registry.registerWorkerMembership("worker-1", List.of("agent-a", "agent-b"));
 
-        verify(jedis).sadd(eq(Constants.RegistryKeys.KNOWN_WORKERS), eq("worker-1"));
+        verify(jedis).sadd(eq(Constants.RegistryKeys.knownWorkers()), eq("worker-1"));
         // Implementation calls sadd separately for each agent type
         verify(jedis, times(2)).sadd(eq(Constants.RegistryKeys.workerDeclaredAgentTypes("worker-1")), anyString());
         verify(jedis).sadd(eq(Constants.RegistryKeys.workerDeclaredAgentTypes("worker-1")), eq("agent-a"));
@@ -75,7 +75,7 @@ class WorkerRegistryTest {
         verify(jedis, never()).zadd(anyString(), anyDouble(), anyString());
         verify(jedis).setex(eq(Constants.RegistryKeys.workerOnlineLease("worker-1")), eq(15L),
                 contains("\"last_seen\""));
-        verify(jedis).sadd(eq(Constants.RegistryKeys.KNOWN_WORKERS), eq("worker-1"));
+        verify(jedis).sadd(eq(Constants.RegistryKeys.knownWorkers()), eq("worker-1"));
     }
 
     @Test
@@ -108,7 +108,7 @@ class WorkerRegistryTest {
         assertNotNull(token);
         assertFalse(token.isEmpty());
         verify(jedis).set(eq(Constants.RegistryKeys.workerOnlineLease("worker-1")), contains(token), any(SetParams.class));
-        verify(jedis).sadd(eq(Constants.RegistryKeys.KNOWN_WORKERS), eq("worker-1"));
+        verify(jedis).sadd(eq(Constants.RegistryKeys.knownWorkers()), eq("worker-1"));
     }
 
     @Test
@@ -366,7 +366,7 @@ class WorkerRegistryTest {
     @Test
     void getAllWorkersReturnsActiveWorkersOnly() {
         // Given
-        when(jedis.smembers(Constants.RegistryKeys.KNOWN_WORKERS))
+        when(jedis.smembers(Constants.RegistryKeys.knownWorkers()))
                 .thenReturn(Set.of("worker-1", "worker-2"));
         when(jedis.get(Constants.RegistryKeys.workerOnlineLease("worker-1")))
                 .thenReturn("{\"version\":1,\"token\":null,\"last_seen\":1000}");
@@ -388,7 +388,7 @@ class WorkerRegistryTest {
     @Test
     void getAllWorkersReturnsEmptyMapWhenNoWorkers() {
         // Given
-        when(jedis.smembers(Constants.RegistryKeys.KNOWN_WORKERS)).thenReturn(Set.of());
+        when(jedis.smembers(Constants.RegistryKeys.knownWorkers())).thenReturn(Set.of());
 
         // When
         Map<String, Map<String, Object>> result = registry.getAllWorkers();

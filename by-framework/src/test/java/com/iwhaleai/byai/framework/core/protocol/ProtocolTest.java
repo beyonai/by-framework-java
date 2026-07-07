@@ -417,7 +417,7 @@ class ProtocolTest {
 
         @Test
         void registryKeysFormats() {
-                assertEquals("byai_gateway:registry:workers", Constants.RegistryKeys.KNOWN_WORKERS);
+                assertEquals("byai_gateway:registry:workers", Constants.RegistryKeys.knownWorkers());
                 assertEquals("byai_gateway:registry:worker:agent_types:w1",
                                 Constants.RegistryKeys.workerDeclaredAgentTypes("w1"));
                 assertEquals("byai_gateway:registry:agent_type:workers:cap1",

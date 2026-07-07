@@ -195,16 +195,17 @@ public class MetricsCollector {
     }
 
     private List<String> scanOnlineWorkerIds(Jedis jedis, int limit) {
-        String prefix = Constants.RegistryKeys.workerOnlineLease("");
-        ScanParams params = new ScanParams().match(prefix + "*").count(100);
+        String pattern = Constants.RegistryKeys.workerOnlineLeaseScanPattern();
+        ScanParams params = new ScanParams().match(pattern).count(100);
         Set<String> result = new HashSet<>();
         String cursor = ScanParams.SCAN_POINTER_START;
         do {
             ScanResult<String> scanResult = jedis.scan(cursor, params);
             cursor = scanResult.getCursor();
             for (String key : scanResult.getResult()) {
-                if (key.startsWith(prefix)) {
-                    result.add(key.substring(prefix.length()));
+                String workerId = Constants.RegistryKeys.workerIdFromOnlineLeaseKey(key);
+                if (workerId != null) {
+                    result.add(workerId);
                     if (limit > 0 && result.size() >= limit) {
                         return new ArrayList<>(result);
                     }

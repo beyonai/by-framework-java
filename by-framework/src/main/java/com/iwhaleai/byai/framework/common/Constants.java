@@ -2,6 +2,7 @@ package com.iwhaleai.byai.framework.common;
 
 public class Constants {
     public static final String REDIS_PREFIX = "byai_gateway:";
+    public static final String V2_PREFIX = "byai_gateway:v2:";
     public static final String SEPARATOR = ":";
     public static final int DEFAULT_SESSION_TTL = 7 * 24 * 3600;
     public static final int TRACE_TTL_SECONDS = 15 * 60;
@@ -22,6 +23,23 @@ public class Constants {
                     "Invalid REDIS_KEY_SCHEMA_VERSION: " + version + " (must be 'v1' or 'v2')");
         }
         return version;
+    }
+
+    /**
+     * Resolve a key according to REDIS_KEY_SCHEMA_VERSION.
+     *
+     * <p>v1 (default): returns v1Key unchanged, byte-for-byte. v2: returns
+     * V2_PREFIX + v2Suffix, where v2Suffix already encodes any Cluster hash
+     * tag needed for same-entity key groups.
+     *
+     * <p>Every key factory method routes through this one function so the
+     * v1/v2 decision lives in exactly one place.
+     */
+    static String versioned(String v1Key, String v2Suffix) {
+        if ("v2".equals(getKeySchemaVersion())) {
+            return V2_PREFIX + v2Suffix;
+        }
+        return v1Key;
     }
 
     // Redis Stream field keys
@@ -98,16 +116,24 @@ public static final int MAX_RETRY_COUNT = 3;
 
     public static class QueueNames {
 
+        /** Same-entity group with RegistryKeys.sessionRegistry: shares the session_id tag. */
         public static String sessionDataStream(String sessionId) {
-            return REDIS_PREFIX + String.format("session:%s:data_stream", sessionId);
+            return versioned(
+                    REDIS_PREFIX + String.format("session:%s:data_stream", sessionId),
+                    String.format("session:{%s}:data_stream", sessionId));
         }
 
         public static String ctrlStream(String agentType) {
-            return REDIS_PREFIX + String.format("ctrl:agent_type:%s", agentType);
+            return versioned(
+                    REDIS_PREFIX + String.format("ctrl:agent_type:%s", agentType),
+                    String.format("ctrl:agent_type:%s", agentType));
         }
 
+        /** Same-entity group with the worker registry keys: shares the worker_id tag. */
         public static String workerCtrlStream(String workerId) {
-            return REDIS_PREFIX + "ctrl:worker:" + workerId;
+            return versioned(
+                    REDIS_PREFIX + "ctrl:worker:" + workerId,
+                    "ctrl:worker:{" + workerId + "}");
         }
 
         // -- Control Plane (Agent Availability) --
@@ -116,69 +142,134 @@ public static final int MAX_RETRY_COUNT = 3;
 
         /** Management stream for agent availability wakeup requests. */
         public static String controlPlaneManagementStream() {
-            return REDIS_PREFIX + "control_plane:mgmt:wakeup";
+            return versioned(REDIS_PREFIX + "control_plane:mgmt:wakeup", "control_plane:mgmt:wakeup");
         }
 
         /** Per-execution result stream for wakeup controller decisions. */
         public static String controlPlaneDecisionStream(String executionId) {
-            return REDIS_PREFIX + "control_plane:mgmt:wakeup:result:" + executionId;
+            return versioned(
+                    REDIS_PREFIX + "control_plane:mgmt:wakeup:result:" + executionId,
+                    "control_plane:mgmt:wakeup:result:" + executionId);
         }
 
         /** Pending delivery queue (single global stream, not per-agent-type). */
         public static String controlPlanePendingQueue() {
-            return REDIS_PREFIX + "control_plane:mgmt:delivery:pending";
+            return versioned(
+                    REDIS_PREFIX + "control_plane:mgmt:delivery:pending", "control_plane:mgmt:delivery:pending");
         }
 
         /** Dead letter stream for failed control-plane work. */
         public static String controlPlaneDeadletterStream() {
-            return REDIS_PREFIX + "control_plane:mgmt:deadletter";
+            return versioned(REDIS_PREFIX + "control_plane:mgmt:deadletter", "control_plane:mgmt:deadletter");
         }
 
         /** Circuit-breaker state key for an agent type. */
         public static String controlPlaneCircuitBreakerKey(String agentType) {
-            return REDIS_PREFIX + "control_plane:circuit:agent_type:" + agentType;
+            return versioned(
+                    REDIS_PREFIX + "control_plane:circuit:agent_type:" + agentType,
+                    "control_plane:circuit:agent_type:" + agentType);
         }
 
         /** User/tenant quota state key. */
         public static String controlPlaneQuotaKey(String userCode) {
-            return REDIS_PREFIX + "control_plane:quota:user:" + userCode;
+            return versioned(
+                    REDIS_PREFIX + "control_plane:quota:user:" + userCode, "control_plane:quota:user:" + userCode);
         }
 
         /** Availability state key for an agent type. */
         public static String controlPlaneAgentAvailability(String agentType) {
-            return REDIS_PREFIX + "control_plane:availability:agent_type:" + agentType;
+            return versioned(
+                    REDIS_PREFIX + "control_plane:availability:agent_type:" + agentType,
+                    "control_plane:availability:agent_type:" + agentType);
         }
 
         /** Fallback routing state key for an agent type. */
         public static String controlPlaneAgentFallback(String agentType) {
-            return REDIS_PREFIX + "control_plane:fallback:agent_type:" + agentType;
+            return versioned(
+                    REDIS_PREFIX + "control_plane:fallback:agent_type:" + agentType,
+                    "control_plane:fallback:agent_type:" + agentType);
         }
 
         /** Deduplication key for concurrent wakeup requests. */
         public static String controlPlaneWakeupDedupe(String agentType, String userCode, String region) {
-            return REDIS_PREFIX + "control_plane:wakeup:dedupe:"
+            String suffix = "control_plane:wakeup:dedupe:"
                     + agentType + ":" + (userCode != null ? userCode : "") + ":"
                     + (region != null ? region : "");
+            return versioned(REDIS_PREFIX + suffix, suffix);
         }
     }
 
     public static class RegistryKeys {
-        public static final String KNOWN_WORKERS = REDIS_PREFIX + "registry:workers";
 
+        /** Global index spanning every worker entity: no hash tag, still version-prefixed. */
+        public static String knownWorkers() {
+            return versioned(REDIS_PREFIX + "registry:workers", "registry:workers");
+        }
+
+        /** Same-entity group with the other worker keys: shares the worker_id tag. */
         public static String workerDeclaredAgentTypes(String workerId) {
-            return REDIS_PREFIX + String.format("registry:worker:agent_types:%s", workerId);
+            return versioned(
+                    REDIS_PREFIX + String.format("registry:worker:agent_types:%s", workerId),
+                    String.format("registry:worker:{%s}:agent_types", workerId));
         }
 
+        /**
+         * Mandatory same-entity group with agentTypeDenied: WorkerRegistry's
+         * denyWorkerForType() writes both keys together and must keep working
+         * atomically under Cluster.
+         */
         public static String agentTypeMembers(String agentType) {
-            return REDIS_PREFIX + String.format("registry:agent_type:workers:%s", agentType);
+            return versioned(
+                    REDIS_PREFIX + String.format("registry:agent_type:workers:%s", agentType),
+                    String.format("registry:agent_type:{%s}:workers", agentType));
         }
 
+        /** Same-entity group with the other worker keys: shares the worker_id tag. */
         public static String workerLock(String workerId) {
-            return REDIS_PREFIX + String.format("registry:worker:lock:%s", workerId);
+            return versioned(
+                    REDIS_PREFIX + String.format("registry:worker:lock:%s", workerId),
+                    String.format("registry:worker:{%s}:lock", workerId));
         }
 
+        /** Same-entity group with the other worker keys: shares the worker_id tag. */
         public static String workerOnlineLease(String workerId) {
-            return REDIS_PREFIX + String.format("registry:worker:online:%s", workerId);
+            return versioned(
+                    REDIS_PREFIX + String.format("registry:worker:online:%s", workerId),
+                    String.format("registry:worker:{%s}:online", workerId));
+        }
+
+        /**
+         * SCAN MATCH glob pattern matching every workerOnlineLease key.
+         *
+         * <p>Under v1 the worker_id is a trailing suffix (prefix + id). Under
+         * v2 it's wrapped in a Cluster hash tag in the middle of the key
+         * (prefix + "{" + id + "}" + suffix) - a bare "{prefix}*" pattern (or
+         * a String.startsWith("{prefix}") check) would never match a real v2
+         * key, since "{"/"}" are literal characters in Redis's glob matching
+         * (only *, ?, [seq] are special), not wildcards.
+         */
+        public static String workerOnlineLeaseScanPattern() {
+            if ("v2".equals(getKeySchemaVersion())) {
+                return V2_PREFIX + "registry:worker:{*}:online";
+            }
+            return REDIS_PREFIX + "registry:worker:online:*";
+        }
+
+        /** Extract worker_id from a key returned by scanning with workerOnlineLeaseScanPattern(). */
+        public static String workerIdFromOnlineLeaseKey(String key) {
+            if ("v2".equals(getKeySchemaVersion())) {
+                String prefix = V2_PREFIX + "registry:worker:{";
+                String suffix = "}:online";
+                if (key.startsWith(prefix) && key.endsWith(suffix)) {
+                    return key.substring(prefix.length(), key.length() - suffix.length());
+                }
+                return null;
+            }
+            String prefix = REDIS_PREFIX + "registry:worker:online:";
+            if (key.startsWith(prefix)) {
+                return key.substring(prefix.length());
+            }
+            return null;
         }
 
         /**
@@ -187,59 +278,99 @@ public static final int MAX_RETRY_COUNT = 3;
          * 内部分为以下 Field 类别：
          * - exec:{execution_id} -> 存储具体的执行明细 JSON
          * - msg_map:{message_id} -> 存储消息 ID 到执行 ID 的映射关系
+         *
+         * <p>Same-entity group with sessionDataStream: shares the session_id tag.
          */
         public static String sessionRegistry(String sessionId) {
-            return REDIS_PREFIX + String.format("session:%s:registry", sessionId);
+            return versioned(
+                    REDIS_PREFIX + String.format("session:%s:registry", sessionId),
+                    String.format("session:{%s}:registry", sessionId));
         }
 
+        /** Same-entity group with taskGroupResults: shares the group_id tag. */
         public static String taskGroup(String groupId) {
-            return REDIS_PREFIX + "task_group:" + groupId;
+            return versioned(REDIS_PREFIX + "task_group:" + groupId, "task_group:{" + groupId + "}");
         }
 
+        /** Same-entity group with taskGroup: shares the group_id tag. */
         public static String taskGroupResults(String groupId) {
-            return REDIS_PREFIX + "task_group:" + groupId + ":results";
+            return versioned(
+                    REDIS_PREFIX + "task_group:" + groupId + ":results",
+                    "task_group:{" + groupId + "}:results");
         }
 
         // --- 服务发现 (Service Discovery) ---
-        public static final String SD_SERVICES = REDIS_PREFIX + "sd:services";
         public static final int SD_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10;
 
+        /** Global index spanning every service name: no hash tag, still version-prefixed. */
+        public static String sdServices() {
+            return versioned(REDIS_PREFIX + "sd:services", "sd:services");
+        }
+
+        /** Same-entity group with sdInstanceDetails: shares the service_name tag. */
         public static String sdActiveInstances(String serviceName) {
-            return REDIS_PREFIX + String.format("sd:active:%s", serviceName);
+            return versioned(
+                    REDIS_PREFIX + String.format("sd:active:%s", serviceName),
+                    String.format("sd:{%s}:active", serviceName));
         }
 
+        /** Same-entity group with sdActiveInstances: shares the service_name tag. */
         public static String sdInstanceDetails(String serviceName) {
-            return REDIS_PREFIX + String.format("sd:instances:%s", serviceName);
+            return versioned(
+                    REDIS_PREFIX + String.format("sd:instances:%s", serviceName),
+                    String.format("sd:{%s}:instances", serviceName));
         }
 
+        /** Same-entity group with the other worker keys: shares the worker_id tag. */
         public static String workerAdminState(String workerId) {
-            return REDIS_PREFIX + "registry:worker:admin:" + workerId;
+            return versioned(
+                    REDIS_PREFIX + "registry:worker:admin:" + workerId,
+                    "registry:worker:{" + workerId + "}:admin");
         }
 
+        /** Mandatory same-entity group with agentTypeMembers (see there for why). */
         public static String agentTypeDenied(String agentType) {
-            return REDIS_PREFIX + "registry:agent_type:denied:" + agentType;
+            return versioned(
+                    REDIS_PREFIX + "registry:agent_type:denied:" + agentType,
+                    "registry:agent_type:{" + agentType + "}:denied");
         }
     }
 
     public static class TraceKeys {
+
+        /**
+         * v1 keeps Java's historical by_framework:trace:* namespace (byte-for-byte
+         * identical to Python's old format). v2 unifies onto the shared
+         * byai_gateway:v2:trace:{id} format used by all three language SDKs
+         * (Python/Java previously shared by_framework:trace:*, TS used a
+         * different byai_gateway:trace:* layout - v2 replaces both). Same-entity
+         * group with traceSpans: shares the trace_id tag.
+         */
         public static String traceMeta(String traceId) {
-            return "by_framework:trace:" + traceId;
+            return versioned("by_framework:trace:" + traceId, "trace:{" + traceId + "}");
         }
 
+        /** Same-entity group with traceMeta: shares the trace_id tag. */
         public static String traceSpans(String traceId) {
-            return "by_framework:trace:spans:" + traceId;
+            return versioned("by_framework:trace:spans:" + traceId, "trace:spans:{" + traceId + "}");
         }
 
+        /**
+         * Cross-entity relative to the trace group (meta/spans): deliberately
+         * untagged, only the prefix moves under v2.
+         */
         public static String traceIndexSession(String sessionId) {
-            return "by_framework:trace:idx:session:" + sessionId;
+            return versioned("by_framework:trace:idx:session:" + sessionId, "trace:idx:session:" + sessionId);
         }
 
+        /** Cross-entity, untagged - see traceIndexSession. */
         public static String traceIndexWorker(String workerId) {
-            return "by_framework:trace:idx:worker:" + workerId;
+            return versioned("by_framework:trace:idx:worker:" + workerId, "trace:idx:worker:" + workerId);
         }
 
+        /** Cross-entity, untagged - see traceIndexSession. */
         public static String traceIndexAgent(String agentType) {
-            return "by_framework:trace:idx:agent:" + agentType;
+            return versioned("by_framework:trace:idx:agent:" + agentType, "trace:idx:agent:" + agentType);
         }
     }
 
