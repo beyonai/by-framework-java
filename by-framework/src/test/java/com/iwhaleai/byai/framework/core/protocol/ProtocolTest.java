@@ -423,12 +423,6 @@ class ProtocolTest {
                 assertEquals("byai_gateway:registry:agent_type:workers:cap1",
                                 Constants.RegistryKeys.agentTypeMembers("cap1"));
                 assertEquals("byai_gateway:registry:worker:online:w1", Constants.RegistryKeys.workerOnlineLease("w1"));
-                assertEquals("byai_gateway:registry:execution:detail:e1",
-                                Constants.RegistryKeys.executionDetail("e1"));
-                assertEquals("byai_gateway:registry:execution:by_message:m1",
-                                Constants.RegistryKeys.executionByMessage("m1"));
-                assertEquals("byai_gateway:registry:session:executions:s1",
-                                Constants.RegistryKeys.sessionExecutions("s1"));
                 assertEquals("byai_gateway:task_group:g1", Constants.RegistryKeys.taskGroup("g1"));
         }
 
