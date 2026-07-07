@@ -13,7 +13,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XAddParams;
 
 import java.util.Collections;
 import java.util.List;
@@ -88,7 +88,7 @@ class GatewayClientSyncTest {
         assertEquals("worker-456", response.getTargetWorkerId());
 
         String expectedStream = Constants.QueueNames.workerCtrlStream("worker-456");
-        verify(jedis).xadd(eq(expectedStream), (StreamEntryID) isNull(), any(Map.class));
+        verify(jedis).xadd(eq(expectedStream), any(XAddParams.class), any(Map.class));
     }
 
     @Test
