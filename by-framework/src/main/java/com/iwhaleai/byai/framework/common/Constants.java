@@ -164,18 +164,6 @@ public static final int MAX_RETRY_COUNT = 3;
             return REDIS_PREFIX + String.format("registry:worker:online:%s", workerId);
         }
 
-        public static String executionDetail(String executionId) {
-            return REDIS_PREFIX + String.format("registry:execution:detail:%s", executionId);
-        }
-
-        public static String executionByMessage(String messageId) {
-            return REDIS_PREFIX + String.format("registry:execution:by_message:%s", messageId);
-        }
-
-        public static String sessionExecutions(String sessionId) {
-            return REDIS_PREFIX + String.format("registry:session:executions:%s", sessionId);
-        }
-
         /**
          * 会话级聚合注册表 (Hash)。
          * <p>

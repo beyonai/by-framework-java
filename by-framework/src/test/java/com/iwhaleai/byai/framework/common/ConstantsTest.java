@@ -117,7 +117,6 @@ class ConstantsTest {
         assertTrue(Constants.RegistryKeys.workerDeclaredAgentTypes("w1").contains("agent_types"));
         assertTrue(Constants.RegistryKeys.agentTypeMembers("cap1").contains("agent_type"));
         assertTrue(Constants.RegistryKeys.workerOnlineLease("w1").contains("online"));
-        assertTrue(Constants.RegistryKeys.executionDetail("exec1").contains("execution"));
         assertTrue(Constants.RegistryKeys.taskGroup("g1").contains("task_group"));
     }
 }
