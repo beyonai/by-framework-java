@@ -2,8 +2,15 @@ package com.iwhaleai.byai.framework.worker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.availability.AvailabilityResult;
 import com.iwhaleai.byai.framework.core.availability.AvailabilityRouter;
 import com.iwhaleai.byai.framework.core.availability.AvailabilityStatus;
@@ -16,8 +23,6 @@ import com.iwhaleai.byai.framework.core.protocol.EventType;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.StreamEntryID;
 
 import java.util.HashMap;
 import java.util.List;
@@ -31,7 +36,8 @@ import java.util.UUID;
 public class AgentContext {
     private final String sessionId;
     private final String traceId;
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
+    private final RedisStreamOps streamOps;
     private final String currentAgentType;
     private final String currentMessageId;
     private final WorkerRegistry workerRegistry;
@@ -49,7 +55,12 @@ public class AgentContext {
             String currentMessageId) {
         this.sessionId = sessionId;
         this.traceId = traceId;
-        this.redisClient = redisClient;
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient);
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.currentAgentType = currentAgentType;
         this.currentMessageId = currentMessageId;
         this.workerRegistry = new WorkerRegistry(redisClient);
@@ -131,16 +142,14 @@ public class AgentContext {
                 .metadata(metadata != null ? metadata : new HashMap<>())
                 .build();
 
-        try (Jedis jedis = redisClient.getResource()) {
+        try {
             String streamName = Constants.QueueNames.sessionDataStream(sessionId);
             Map<String, String> fields = new HashMap<>();
             fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(msg));
             fields.put(Constants.RedisFields.PAYLOAD, fields.get(Constants.RedisFields.DATA));
 
-            redis.clients.jedis.Pipeline pipe = jedis.pipelined();
-            pipe.xadd(streamName, (redis.clients.jedis.StreamEntryID) null, fields);
-            pipe.expire(streamName, Constants.DEFAULT_SESSION_TTL);
-            pipe.sync();
+            streamOps.xadd(streamName, fields, XAddOptions.noTrim());
+            redisOps.expire(streamName, Constants.DEFAULT_SESSION_TTL);
         } catch (Exception e) {
             throw new RuntimeException("Failed to emit event", e);
         }
@@ -357,10 +366,10 @@ public class AgentContext {
                 ? availResult.getStreamName()
                 : Constants.QueueNames.ctrlStream(selectedAgentType);
 
-        try (Jedis jedis = redisClient.getResource()) {
+        try {
             Map<String, String> fields = new HashMap<>();
             fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(command));
-            jedis.xadd(resolvedStream, (StreamEntryID) null, fields);
+            streamOps.xadd(resolvedStream, fields, XAddOptions.noTrim());
         } catch (Exception e) {
             throw new RuntimeException("Failed to enqueue agent call", e);
         }
@@ -408,14 +417,14 @@ public class AgentContext {
         int total = requests.size();
         List<Map<String, String>> dispatched = new java.util.ArrayList<>();
 
-        try (Jedis jedis = redisClient.getResource()) {
+        try {
             String key = Constants.RegistryKeys.taskGroup(groupId);
             Map<String, String> groupData = new HashMap<>();
             groupData.put(Constants.TASK_GROUP_FIELD_TOTAL, String.valueOf(total));
             groupData.put(Constants.TASK_GROUP_FIELD_COMPLETED, "0");
             groupData.put(Constants.TASK_GROUP_FIELD_SOURCE_AGENT, currentAgentType);
-            jedis.hset(key, groupData);
-            jedis.expire(key, Constants.TASK_GROUP_TTL_SECONDS);
+            redisOps.hsetAll(key, groupData);
+            redisOps.expire(key, Constants.TASK_GROUP_TTL_SECONDS);
 
             for (Map<String, Object> req : requests) {
                 String targetAgentType = (String) req.get(Constants.DispatchFields.AGENT_TYPE);
@@ -447,7 +456,7 @@ public class AgentContext {
 
                 Map<String, String> fields = new HashMap<>();
                 fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(command));
-                jedis.xadd(Constants.QueueNames.ctrlStream(targetAgentType), (StreamEntryID) null, fields);
+                streamOps.xadd(Constants.QueueNames.ctrlStream(targetAgentType), fields, XAddOptions.noTrim());
 
                 // Initialize execution tracking for each dispatched task
                 try {
@@ -503,33 +512,31 @@ public class AgentContext {
         long timeoutMillis = (long) (timeoutSeconds * 1000);
 
         while (System.currentTimeMillis() - startTime < timeoutMillis) {
-            try (Jedis jedis = redisClient.getResource()) {
-                // Get total from group key
-                String totalStr = jedis.hget(groupKey, Constants.TASK_GROUP_FIELD_TOTAL);
-                if (totalStr != null) {
-                    total = Integer.parseInt(totalStr);
-                }
+            // Get total from group key
+            String totalStr = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_TOTAL);
+            if (totalStr != null) {
+                total = Integer.parseInt(totalStr);
+            }
 
-                // Get all results
-                Map<String, String> rawResults = jedis.hgetAll(resultsKey);
-                if (rawResults != null && !rawResults.isEmpty()) {
-                    List<Map<String, Object>> results = new java.util.ArrayList<>();
-                    for (Map.Entry<String, String> entry : rawResults.entrySet()) {
-                        String msgId = entry.getKey();
-                        try {
-                            @SuppressWarnings("unchecked")
-                            Map<String, Object> data = objectMapper.readValue(entry.getValue(), Map.class);
-                            Map<String, Object> result = new HashMap<>();
-                            result.put("message_id", msgId);
-                            result.putAll(data);
-                            results.add(result);
-                        } catch (Exception e) {
-                            log.warn("Failed to parse result for message {}: {}", msgId, e.getMessage());
-                        }
+            // Get all results
+            Map<String, String> rawResults = redisOps.hgetAll(resultsKey);
+            if (rawResults != null && !rawResults.isEmpty()) {
+                List<Map<String, Object>> results = new java.util.ArrayList<>();
+                for (Map.Entry<String, String> entry : rawResults.entrySet()) {
+                    String msgId = entry.getKey();
+                    try {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> data = objectMapper.readValue(entry.getValue(), Map.class);
+                        Map<String, Object> result = new HashMap<>();
+                        result.put("message_id", msgId);
+                        result.putAll(data);
+                        results.add(result);
+                    } catch (Exception e) {
+                        log.warn("Failed to parse result for message {}: {}", msgId, e.getMessage());
                     }
-                    if (results.size() >= total) {
-                        return results;
-                    }
+                }
+                if (results.size() >= total) {
+                    return results;
                 }
             }
 
@@ -543,8 +550,8 @@ public class AgentContext {
         }
 
         // Return whatever we have collected
-        try (Jedis jedis = redisClient.getResource()) {
-            Map<String, String> rawResults = jedis.hgetAll(resultsKey);
+        try {
+            Map<String, String> rawResults = redisOps.hgetAll(resultsKey);
             if (rawResults != null && !rawResults.isEmpty()) {
                 List<Map<String, Object>> results = new java.util.ArrayList<>();
                 for (Map.Entry<String, String> entry : rawResults.entrySet()) {

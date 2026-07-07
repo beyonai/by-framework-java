@@ -99,6 +99,13 @@ public class StandaloneRedisOps implements RedisOps {
     }
 
     @Override
+    public long hsetAll(String key, Map<String, String> fields) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.hset(key, fields);
+        }
+    }
+
+    @Override
     public long hincrBy(String key, String field, long value) {
         try (Jedis jedis = redisClient.getResource()) {
             return jedis.hincrBy(key, field, value);

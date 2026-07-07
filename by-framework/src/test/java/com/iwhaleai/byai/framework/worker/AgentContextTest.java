@@ -11,8 +11,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XAddParams;
 
 import java.util.List;
 import java.util.Map;
@@ -30,16 +30,12 @@ class AgentContextTest {
     @Mock
     private Jedis jedis;
 
-    @Mock
-    private redis.clients.jedis.Pipeline pipeline;
-
     private AgentContext context;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @BeforeEach
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
-        lenient().when(jedis.pipelined()).thenReturn(pipeline);
         // AvailabilityRouter checks circuit breaker and quota before online check
         lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit:"))).thenReturn(null);
         lenient().when(jedis.get(startsWith("byai_gateway:control_plane:quota:"))).thenReturn(null);
@@ -57,9 +53,8 @@ class AgentContextTest {
         context.emitChunk("hello");
 
         String expectedStream = "byai_gateway:session:sess-1:data_stream";
-        verify(pipeline, atLeastOnce()).xadd(eq(expectedStream), (StreamEntryID) any(), anyMap());
-        verify(pipeline, atLeastOnce()).expire(eq(expectedStream), eq((long) Constants.DEFAULT_SESSION_TTL));
-        verify(pipeline, atLeastOnce()).sync();
+        verify(jedis, atLeastOnce()).xadd(eq(expectedStream), any(XAddParams.class), anyMap());
+        verify(jedis, atLeastOnce()).expire(eq(expectedStream), eq((long) Constants.DEFAULT_SESSION_TTL));
     }
 
     @Test
@@ -67,7 +62,7 @@ class AgentContextTest {
         context.emitArtifact("artifact-url");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         Map<String, Object> data = objectMapper.readValue(dataJson, Map.class);
@@ -79,7 +74,7 @@ class AgentContextTest {
         Map<String, String> result = context.askUser("prompt content");
 
         assertEquals(Map.of("status", "WAITING_USER"), result);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), anyMap());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), anyMap());
     }
 
     @Test
@@ -87,7 +82,7 @@ class AgentContextTest {
         context.askUser("Please confirm");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(pipeline, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         Map<String, Object> data = objectMapper.readValue(dataJson, Map.class);
@@ -108,7 +103,7 @@ class AgentContextTest {
         assertNotNull(result.get("message_id"));
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -130,7 +125,7 @@ class AgentContextTest {
         assertEquals("FAILED", result.get("status"));
         assertNotNull(result.get("error_code"));
         assertTrue(result.get("error_code").toString().contains("ERR_AGENT_TYPE_UNAVAILABLE"));
-        verify(jedis, never()).xadd(anyString(), (StreamEntryID) any(), anyMap());
+        verify(jedis, never()).xadd(anyString(), any(XAddParams.class), anyMap());
     }
 
     @Test
@@ -142,7 +137,7 @@ class AgentContextTest {
         context.callAgent("target-agent", "content", null, true, null, "group-123");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis, atLeastOnce()).xadd(anyString(), (StreamEntryID) any(), fieldsCaptor.capture());
+        verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -166,7 +161,7 @@ class AgentContextTest {
         verify(jedis).expire(anyString(), eq(86400L));
 
         // 2. Commands sent via jedis.xadd (not pipeline)
-        verify(jedis, times(2)).xadd(anyString(), (StreamEntryID) any(), anyMap());
+        verify(jedis, times(2)).xadd(anyString(), any(XAddParams.class), anyMap());
     }
 
     @Test

@@ -83,6 +83,11 @@ public class ClusterRedisOps implements RedisOps {
     }
 
     @Override
+    public long hsetAll(String key, Map<String, String> fields) {
+        return jedisCluster.hset(key, fields);
+    }
+
+    @Override
     public long hincrBy(String key, String field, long value) {
         return jedisCluster.hincrBy(key, field, value);
     }
