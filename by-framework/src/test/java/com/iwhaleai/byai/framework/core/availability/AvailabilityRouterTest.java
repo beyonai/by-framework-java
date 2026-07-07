@@ -10,6 +10,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XAddParams;
 import redis.clients.jedis.params.XReadParams;
 import redis.clients.jedis.resps.StreamEntry;
 
@@ -118,7 +119,7 @@ class AvailabilityRouterTest {
 
         // XADD for wakeup emission
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
         // XREAD returns a READY decision (wrapped in "data" field, matching Python format)
@@ -148,7 +149,7 @@ class AvailabilityRouterTest {
 
         // Verify wakeup was emitted
         verify(jedis).xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap());
+                any(XAddParams.class), anyMap());
     }
 
     @Test
@@ -157,7 +158,7 @@ class AvailabilityRouterTest {
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
 
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
         // XREAD returns empty (no decision within timeout)
@@ -176,10 +177,10 @@ class AvailabilityRouterTest {
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
 
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
         when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.WAKE_AND_QUEUE);
@@ -190,9 +191,9 @@ class AvailabilityRouterTest {
 
         // Verify wakeup was emitted AND pending delivery was queued
         verify(jedis).xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap());
+                any(XAddParams.class), anyMap());
         verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
-                (StreamEntryID) isNull(), anyMap());
+                any(XAddParams.class), anyMap());
     }
 
     @Test
@@ -201,7 +202,7 @@ class AvailabilityRouterTest {
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(false, Collections.emptyList()));
 
         when(jedis.xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
         DeliveryIntent intent = makeIntent("agent-x", RoutePolicy.QUEUE_ONLY);
@@ -211,9 +212,9 @@ class AvailabilityRouterTest {
 
         // Verify pending delivery was queued, but NO wakeup emitted
         verify(jedis).xadd(eq(Constants.QueueNames.controlPlanePendingQueue()),
-                (StreamEntryID) isNull(), anyMap());
+                any(XAddParams.class), anyMap());
         verify(jedis, never()).xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap());
+                any(XAddParams.class), anyMap());
     }
 
     @Test
@@ -279,7 +280,7 @@ class AvailabilityRouterTest {
                 .thenReturn(new WorkerRegistry.OnlineAgentCheckResult(true, List.of("w-1")));
 
         when(jedis.xadd(eq(Constants.QueueNames.controlPlaneManagementStream()),
-                (StreamEntryID) isNull(), anyMap()))
+                any(XAddParams.class), anyMap()))
                 .thenReturn(new StreamEntryID("1-0"));
 
         // XREAD returns a READY decision (wrapped in "data" field, matching Python format)
