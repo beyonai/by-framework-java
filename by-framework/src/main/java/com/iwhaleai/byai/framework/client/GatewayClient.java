@@ -1,8 +1,12 @@
 package com.iwhaleai.byai.framework.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import com.iwhaleai.byai.framework.core.availability.AvailabilityResult;
 import com.iwhaleai.byai.framework.core.availability.AvailabilityRouter;
@@ -23,7 +27,6 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -42,6 +45,7 @@ public class GatewayClient<T> {
     private static final String LANGFUSE_PARENT_OBSERVATION_ID = "langfuse_parent_observation_id";
 
     private final RedisClient redisClient;
+    private final RedisStreamOps streamOps;
     private final WorkerRegistry registry;
     private final AvailabilityRouter availabilityRouter;
     @Getter
@@ -68,6 +72,9 @@ public class GatewayClient<T> {
             List<GatewayInterceptor> interceptors,
             ClientDispatchTracer clientDispatchTracer) {
         this.redisClient = redisClient;
+        this.streamOps = redisClient.getJedisCluster() != null
+                ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
+                : new StandaloneRedisStreamOps(redisClient);
         this.registry = registry;
         this.interceptors = interceptors != null ? interceptors : new ArrayList<>();
         this.clientDispatchTracer = clientDispatchTracer;
@@ -249,11 +256,9 @@ public class GatewayClient<T> {
             }
 
             String jsonPayload = objectMapper.writeValueAsString(command);
-            try (Jedis jedis = redisClient.getResource()) {
-                Map<String, String> redisData = new HashMap<>();
-                redisData.put(Constants.RedisFields.DATA, jsonPayload);
-                jedis.xadd(resolvedStreamName, (redis.clients.jedis.StreamEntryID) null, redisData);
-            }
+            Map<String, String> redisData = new HashMap<>();
+            redisData.put(Constants.RedisFields.DATA, jsonPayload);
+            streamOps.xadd(resolvedStreamName, redisData, XAddOptions.noTrim());
 
             return SendResponse.builder()
                     .success(true)
@@ -712,11 +717,9 @@ public class GatewayClient<T> {
 
             long dispatchStartedAt = System.currentTimeMillis();
             String jsonPayload = objectMapper.writeValueAsString(command);
-            try (Jedis jedis = redisClient.getResource()) {
-                Map<String, String> redisData = new HashMap<>();
-                redisData.put(Constants.RedisFields.DATA, jsonPayload);
-                jedis.xadd(resolvedStream, (redis.clients.jedis.StreamEntryID) null, redisData);
-            }
+            Map<String, String> redisData = new HashMap<>();
+            redisData.put(Constants.RedisFields.DATA, jsonPayload);
+            streamOps.xadd(resolvedStream, redisData, XAddOptions.noTrim());
             long dispatchEndedAt = System.currentTimeMillis();
 
             log.info("Message sent to gateway: {} (target={}, stream={})", messageId, selectedAgentType, resolvedStream);

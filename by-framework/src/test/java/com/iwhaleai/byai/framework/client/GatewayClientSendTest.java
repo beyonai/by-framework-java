@@ -18,7 +18,7 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.params.XAddParams;
 
 import java.util.Collections;
 import java.util.ArrayList;
@@ -67,7 +67,7 @@ class GatewayClientSendTest {
         // Verify command was sent to Redis stream
         String expectedStream = Constants.QueueNames.ctrlStream("demo-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(eq(expectedStream), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(eq(expectedStream), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -97,7 +97,7 @@ class GatewayClientSendTest {
                 eq("trace-order"));
         inOrder.verify(jedis).xadd(
                 eq(Constants.QueueNames.ctrlStream("demo-agent")),
-                (StreamEntryID) isNull(),
+                any(XAddParams.class),
                 any(Map.class));
     }
 
@@ -117,7 +117,7 @@ class GatewayClientSendTest {
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis).xadd(eq(Constants.QueueNames.workerCtrlStream("worker-1")),
-                (StreamEntryID) isNull(), fieldsCaptor.capture());
+                any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -136,7 +136,7 @@ class GatewayClientSendTest {
         assertTrue(response.isSuccess());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -161,7 +161,7 @@ class GatewayClientSendTest {
         assertTrue(response.isSuccess());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -195,7 +195,7 @@ class GatewayClientSendTest {
         assertEquals(1, tracer.observation.endCalls.size());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -220,7 +220,7 @@ class GatewayClientSendTest {
         assertTrue(tracer.startCalls.isEmpty());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -240,7 +240,7 @@ class GatewayClientSendTest {
         assertTrue(response.isSuccess());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -345,7 +345,7 @@ class GatewayClientSendTest {
         assertTrue(response.isSuccess());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         ResumeCommand cmd = objectMapper.readValue(dataJson, ResumeCommand.class);
@@ -381,7 +381,7 @@ class GatewayClientSendTest {
         client.sendMessage("demo-agent", "sess-1", "original");
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -402,7 +402,7 @@ class GatewayClientSendTest {
         assertEquals("custom-msg-id", response.getMessageId());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -423,7 +423,7 @@ class GatewayClientSendTest {
         assertTrue(response.isSuccess());
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(jedis).xadd(anyString(), (StreamEntryID) isNull(), fieldsCaptor.capture());
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
 
         String dataJson = fieldsCaptor.getValue().get("data");
         AskAgentCommand cmd = objectMapper.readValue(dataJson, AskAgentCommand.class);
@@ -475,7 +475,7 @@ class GatewayClientSendTest {
         GatewayClient.SendResponse response = client.sendCommand(command, "custom:stream:name");
 
         assertTrue(response.isSuccess());
-        verify(jedis).xadd(eq("custom:stream:name"), (StreamEntryID) isNull(), any(Map.class));
+        verify(jedis).xadd(eq("custom:stream:name"), any(XAddParams.class), any(Map.class));
     }
 
     @Test
