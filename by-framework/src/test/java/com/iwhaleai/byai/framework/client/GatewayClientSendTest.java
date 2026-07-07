@@ -307,6 +307,28 @@ class GatewayClientSendTest {
     }
 
     @Test
+    void traceIndexWriteFailureDoesNotBlockTraceMetaSpansOrOtherIndexes() {
+        FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+        // Cross-entity relative to the trace group: a failure here must not
+        // prevent trace_meta/trace_spans (already-written, same-entity group)
+        // from getting their TTL, nor block the sibling agent-type index.
+        doThrow(new RuntimeException("redis index down"))
+                .when(jedis).zadd(eq("by_framework:trace:idx:session:sess-1"), anyDouble(), eq("trace-client"));
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, null, null, "msg-client", "trace-client", null, null);
+
+        assertTrue(response.isSuccess());
+        verify(jedis, atLeastOnce()).hset(eq("by_framework:trace:trace-client"), any(Map.class));
+        verify(jedis).rpush(eq("by_framework:trace:spans:trace-client"), anyString());
+        verify(jedis).expire("by_framework:trace:trace-client", Constants.TRACE_TTL_SECONDS);
+        verify(jedis).expire("by_framework:trace:spans:trace-client", Constants.TRACE_TTL_SECONDS);
+        verify(jedis).zadd(eq("by_framework:trace:idx:agent:demo-agent"), anyDouble(), eq("trace-client"));
+    }
+
+    @Test
     void sendMessageWithResumeActionType() throws Exception {
         FakeSendRegistry registry = new FakeSendRegistry(redisClient, "worker-1");
         GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());

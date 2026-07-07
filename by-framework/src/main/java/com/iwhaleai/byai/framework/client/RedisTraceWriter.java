@@ -26,20 +26,31 @@ class RedisTraceWriter {
             return;
         }
 
-        try (Jedis jedis = redisClient.getResource()) {
-            String traceKey = Constants.TraceKeys.traceMeta(record.traceId());
-            String spanKey = Constants.TraceKeys.traceSpans(record.traceId());
-            double score = record.startTs();
+        String traceKey = Constants.TraceKeys.traceMeta(record.traceId());
+        String spanKey = Constants.TraceKeys.traceSpans(record.traceId());
+        double score = record.startTs();
 
+        // trace_meta/trace_spans share a Cluster hash tag (trace_id) since
+        // Phase 2a, so this group stays atomic under one error boundary. The
+        // session/worker/agent_type indexes below are cross-entity relative
+        // to the trace group, so they're written as independent, best-effort
+        // calls afterward - a failure in one must not block the others or
+        // undo the trace_meta/trace_spans write that already landed above
+        // (in particular, it must not skip their TTL, which used to happen
+        // when everything shared one try/catch).
+        try (Jedis jedis = redisClient.getResource()) {
             jedis.hset(traceKey, traceMeta(record));
             jedis.rpush(spanKey, objectMapper.writeValueAsString(span(record)));
-            indexTrace(jedis, Constants.TraceKeys.traceIndexSession(record.sessionId()), score, record.traceId());
-            indexTrace(jedis, Constants.TraceKeys.traceIndexWorker(record.workerId()), score, record.traceId());
-            indexTrace(jedis, Constants.TraceKeys.traceIndexAgent(record.targetAgentType()), score, record.traceId());
-            expireTraceKeys(jedis, traceKey, spanKey, record);
+            jedis.expire(traceKey, Constants.TRACE_TTL_SECONDS);
+            jedis.expire(spanKey, Constants.TRACE_TTL_SECONDS);
         } catch (Exception e) {
             log.warn("Redis client.dispatch trace write skipped: {}", e.getMessage());
+            return;
         }
+
+        writeTraceIndex(Constants.TraceKeys.traceIndexSession(record.sessionId()), score, record.traceId());
+        writeTraceIndex(Constants.TraceKeys.traceIndexWorker(record.workerId()), score, record.traceId());
+        writeTraceIndex(Constants.TraceKeys.traceIndexAgent(record.targetAgentType()), score, record.traceId());
     }
 
     private Map<String, String> traceMeta(ClientDispatchRecord record) {
@@ -80,24 +91,22 @@ class RedisTraceWriter {
         return span;
     }
 
-    private void indexTrace(Jedis jedis, String key, double score, String traceId) {
+    /**
+     * Best-effort write to a trace lookup index (session/worker/agent_type).
+     *
+     * <p>Cross-entity relative to the trace group (meta/spans), so it's
+     * written independently on its own connection; failure here is logged
+     * and never propagated to the caller.
+     */
+    private void writeTraceIndex(String key, double score, String traceId) {
         if (isBlank(key) || isBlank(traceId) || key.endsWith(":")) {
             return;
         }
-        jedis.zadd(key, score, traceId);
-    }
-
-    private void expireTraceKeys(Jedis jedis, String traceKey, String spanKey, ClientDispatchRecord record) {
-        jedis.expire(traceKey, Constants.TRACE_TTL_SECONDS);
-        jedis.expire(spanKey, Constants.TRACE_TTL_SECONDS);
-        expireIfPresent(jedis, Constants.TraceKeys.traceIndexSession(record.sessionId()));
-        expireIfPresent(jedis, Constants.TraceKeys.traceIndexWorker(record.workerId()));
-        expireIfPresent(jedis, Constants.TraceKeys.traceIndexAgent(record.targetAgentType()));
-    }
-
-    private void expireIfPresent(Jedis jedis, String key) {
-        if (!isBlank(key) && !key.endsWith(":")) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.zadd(key, score, traceId);
             jedis.expire(key, Constants.TRACE_TTL_SECONDS);
+        } catch (Exception e) {
+            log.warn("RedisTraceWriter: trace index write failed for {}: {}", key, e.getMessage());
         }
     }
 
