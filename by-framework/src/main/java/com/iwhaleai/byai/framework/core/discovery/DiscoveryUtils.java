@@ -23,8 +23,13 @@ public class DiscoveryUtils {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.connect(InetAddress.getByName(actualTargetHost), actualTargetPort);
             return socket.getLocalAddress().getHostAddress();
-        } catch (SocketException | UnknownHostException e) {
+        } catch (SocketException | UnknownHostException | java.io.UncheckedIOException e) {
             // 兜底：获取主机名对应的 IP
+            // DatagramSocket.connect() 在部分 JDK 版本下（NIO 适配的
+            // DatagramSocketAdaptor）会把底层 IOException 包装成
+            // UncheckedIOException 而不是抛出受检的 SocketException，
+            // 例如网络不可达（无出网权限的容器/沙箱环境）时；必须一并捕获，
+            // 否则这条兜底路径永远不会被触发。
             try {
                 return InetAddress.getLocalHost().getHostAddress();
             } catch (UnknownHostException ex) {

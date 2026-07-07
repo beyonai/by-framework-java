@@ -16,6 +16,8 @@ public final class ExecutionStatus {
     // Error codes for error_code field
     public static final String ERR_WORKER_NOT_ONLINE = "ERR_WORKER_NOT_ONLINE";
     public static final String ERR_AGENT_TYPE_UNAVAILABLE = "ERR_AGENT_TYPE_UNAVAILABLE";
+    public static final String ERR_AGENT_CIRCUIT_OPEN = "ERR_AGENT_CIRCUIT_OPEN";
+    public static final String ERR_TENANT_QUOTA_EXCEEDED = "ERR_TENANT_QUOTA_EXCEEDED";
 
     private ExecutionStatus() {
         // Prevent instantiation

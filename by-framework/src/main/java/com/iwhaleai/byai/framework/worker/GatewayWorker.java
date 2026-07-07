@@ -18,12 +18,15 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 public abstract class GatewayWorker {
     private static final Logger LOG = LoggerFactory.getLogger(GatewayWorker.class);
@@ -34,6 +37,29 @@ public abstract class GatewayWorker {
     protected final PluginRegistry pluginRegistry;
     protected final ObjectMapper objectMapper = new ObjectMapper();
     private ScheduledExecutorService heartbeatExecutor;
+
+    /**
+     * Called after each heartbeat with the latest admin lifecycle value ("active", "suspended", "evicted").
+     * Set by WorkerRunner to update its internal state machine.
+     */
+    private Consumer<String> lifecycleCallback;
+
+    /**
+     * Called after each heartbeat with the set of denied agent types for this worker.
+     * Set by WorkerRunner to update its denylist cache.
+     */
+    private Consumer<Set<String>> denylistRefresh;
+
+    /**
+     * Called before each heartbeat renewal. Returns false if the consumer loop is unhealthy.
+     * When false, the heartbeat stops renewing the lease so the worker is evicted from routing.
+     */
+    private java.util.function.BooleanSupplier healthCheck;
+
+    /**
+     * Called when the health check fails. Allows the runner to initiate shutdown.
+     */
+    private Runnable onUnhealthy;
 
     public GatewayWorker(String workerId) {
         this(workerId, RedisClient.getInstance());
@@ -52,6 +78,22 @@ public abstract class GatewayWorker {
 
     public PluginRegistry getPluginRegistry() {
         return pluginRegistry;
+    }
+
+    public void setLifecycleCallback(Consumer<String> lifecycleCallback) {
+        this.lifecycleCallback = lifecycleCallback;
+    }
+
+    public void setDenylistRefresh(Consumer<Set<String>> denylistRefresh) {
+        this.denylistRefresh = denylistRefresh;
+    }
+
+    public void setHealthCheck(java.util.function.BooleanSupplier healthCheck) {
+        this.healthCheck = healthCheck;
+    }
+
+    public void setOnUnhealthy(Runnable onUnhealthy) {
+        this.onUnhealthy = onUnhealthy;
     }
 
     public abstract List<String> getAgentTypes();
@@ -84,8 +126,33 @@ public abstract class GatewayWorker {
         int leaseTtl = getHeartbeatLeaseTtlSeconds();
         int interval = getHeartbeatIntervalSeconds();
 
+        // Read admin-controlled lifecycle BEFORE registering membership.
+        // A worker that restarts while suspended must not re-join the
+        // agent_type:members sets or start consuming until explicitly resumed.
+        String startupLifecycle = "active";
+        try {
+            Map<String, String> adminState = registry.getWorkerAdminState(workerId);
+            String lc = adminState.get("lifecycle");
+            if (lc != null && !lc.isEmpty()) {
+                startupLifecycle = lc;
+            }
+        } catch (Exception e) {
+            LOG.warn("[{}] Failed to read admin state at startup: {}", workerId, e.getMessage());
+        }
+
+        if (!"active".equals(startupLifecycle)) {
+            LOG.warn("[{}] Startup admin lifecycle is '{}'; skipping member registration — worker will not consume until resumed",
+                    workerId, startupLifecycle);
+            // Propagate the startup lifecycle to the runner immediately
+            if (lifecycleCallback != null) {
+                lifecycleCallback.accept(startupLifecycle);
+            }
+        }
+
         registry.heartbeatWorker(workerId, leaseTtl);
         pluginRegistry.onWorkerStartup(this);
+
+        final String[] currentLifecycle = {startupLifecycle};
 
         heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "heartbeat-" + workerId);
@@ -95,7 +162,40 @@ public abstract class GatewayWorker {
 
         heartbeatExecutor.scheduleAtFixedRate(() -> {
             try {
+                // Health check: if consumer loop is stalled, stop renewing the lease
+                if (healthCheck != null && !healthCheck.getAsBoolean()) {
+                    LOG.error("[{}] Heartbeat stopping: consumer loop is unhealthy", workerId);
+                    heartbeatExecutor.shutdown();
+                    if (onUnhealthy != null) onUnhealthy.run();
+                    return;
+                }
+
                 registry.heartbeatWorker(workerId, leaseTtl);
+
+                // Read admin state after each heartbeat
+                Map<String, String> adminState = registry.getWorkerAdminState(workerId);
+                String lc = adminState.get("lifecycle");
+                currentLifecycle[0] = (lc != null && !lc.isEmpty()) ? lc : "active";
+
+                if (lifecycleCallback != null) {
+                    lifecycleCallback.accept(currentLifecycle[0]);
+                }
+
+                // Self-healing: re-register membership when active
+                if ("active".equals(currentLifecycle[0])) {
+                    registry.registerWorkerMembership(workerId, getAgentTypes());
+                }
+
+                // Refresh denylist for each agent type
+                if (denylistRefresh != null) {
+                    Set<String> denied = new HashSet<>();
+                    for (String agentType : getAgentTypes()) {
+                        if (registry.isWorkerDeniedForType(agentType, workerId)) {
+                            denied.add(agentType);
+                        }
+                    }
+                    denylistRefresh.accept(denied);
+                }
             } catch (Exception e) {
                 LOG.error("[{}] Heartbeat failed: {}", workerId, e.getMessage());
             }
@@ -140,39 +240,9 @@ public abstract class GatewayWorker {
             pluginRegistry.onTaskStart(context);
 
             if (isResume) {
-                String taskGroupId = header.taskGroupId();
-                if (taskGroupId != null && !taskGroupId.isBlank()) {
-                    try (Jedis jedis = redisClient.getResource()) {
-                        String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
-                        String totalStr = jedis.hget(groupKey, "total");
-                        if (totalStr != null) {
-                            if (command instanceof ResumeCommand resumeCommand) {
-                                String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
-                                Map<String, Object> resultData = new HashMap<>();
-                                resultData.put("status", resumeCommand.status());
-                                resultData.put("reply_data", resumeCommand.replyData());
-                                resultData.put("content", resumeCommand.content());
-                                resultData.put("metadata", resumeCommand.header().metadata());
-                                resultData.put("extra_payload", resumeCommand.extraPayload());
-                                jedis.hset(
-                                        resultsKey,
-                                        header.messageId(),
-                                        objectMapper.writeValueAsString(resultData)
-                                );
-                                jedis.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
-                            }
-                            long completed = jedis.hincrBy(groupKey, "completed", 1);
-                            int total = Integer.parseInt(totalStr);
-                            if (completed < total) {
-                                LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
-                                context.emitState(AgentState.QUEUED + ": waiting_for_group");
-                                return;
-                            }
-                            LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
-                        }
-                    }
+                if (!handleTaskGroupResume(command, header, context)) {
+                    return;
                 }
-                context.emitState(AgentState.RESUMED);
             }
 
             Object result = processCommand(command, context);
@@ -188,30 +258,7 @@ public abstract class GatewayWorker {
                 context.emitState(AgentState.COMPLETED);
             }
 
-            // Extract final message and emit FINAL_ANSWER
-            String finalMessage = null;
-            Object content = taskResult.content();
-            if (content instanceof String s && !s.isEmpty()) {
-                finalMessage = s;
-            } else if (content instanceof List<?> l && !l.isEmpty()) {
-                try {
-                    finalMessage = objectMapper.writeValueAsString(l);
-                } catch (Exception e) {
-                    LOG.warn("Failed to serialize content for FINAL_ANSWER", e);
-                }
-            } else if (taskResult.replyData() instanceof String replyStr && !replyStr.isEmpty()) {
-                finalMessage = replyStr;
-            } else if (taskResult.replyData() != null) {
-                try {
-                    finalMessage = objectMapper.writeValueAsString(taskResult.replyData());
-                } catch (Exception e) {
-                    LOG.warn("Failed to serialize reply_data for FINAL_ANSWER", e);
-                }
-            }
-
-            if (finalMessage != null) {
-                context.emitChunk(finalMessage, EventType.FINAL_ANSWER.getValue());
-            }
+            emitFinalAnswer(context, taskResult);
 
             // Emit APP_STREAM_RESPONSE if conditions are met
             boolean shouldEmitStreamEnd = !hasSourceAgent && AgentState.isTerminalState(finalStatus) && !permissionTransferred;
@@ -292,6 +339,68 @@ public abstract class GatewayWorker {
         }
     }
 
+    private boolean handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
+        String taskGroupId = header.taskGroupId();
+        if (taskGroupId != null && !taskGroupId.isBlank()) {
+            try (Jedis jedis = redisClient.getResource()) {
+                String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
+                String totalStr = jedis.hget(groupKey, "total");
+                if (totalStr != null) {
+                    if (command instanceof ResumeCommand resumeCommand) {
+                        String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
+                        Map<String, Object> resultData = new HashMap<>();
+                        resultData.put("status", resumeCommand.status());
+                        resultData.put("reply_data", resumeCommand.replyData());
+                        resultData.put("content", resumeCommand.content());
+                        resultData.put("metadata", resumeCommand.header().metadata());
+                        resultData.put("extra_payload", resumeCommand.extraPayload());
+                        jedis.hset(
+                                resultsKey,
+                                header.messageId(),
+                                objectMapper.writeValueAsString(resultData)
+                        );
+                        jedis.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
+                    }
+                    long completed = jedis.hincrBy(groupKey, "completed", 1);
+                    int total = Integer.parseInt(totalStr);
+                    if (completed < total) {
+                        LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
+                        context.emitState(AgentState.QUEUED + ": waiting_for_group");
+                        return false;
+                    }
+                    LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
+                }
+            }
+        }
+        context.emitState(AgentState.RESUMED);
+        return true;
+    }
+
+    private void emitFinalAnswer(AgentContext context, AgentTaskResult taskResult) {
+        String finalMessage = null;
+        Object content = taskResult.content();
+        if (content instanceof String s && !s.isEmpty()) {
+            finalMessage = s;
+        } else if (content instanceof List<?> l && !l.isEmpty()) {
+            try {
+                finalMessage = objectMapper.writeValueAsString(l);
+            } catch (Exception e) {
+                LOG.warn("Failed to serialize content for FINAL_ANSWER", e);
+            }
+        } else if (taskResult.replyData() instanceof String replyStr && !replyStr.isEmpty()) {
+            finalMessage = replyStr;
+        } else if (taskResult.replyData() != null) {
+            try {
+                finalMessage = objectMapper.writeValueAsString(taskResult.replyData());
+            } catch (Exception e) {
+                LOG.warn("Failed to serialize reply_data for FINAL_ANSWER", e);
+            }
+        }
+
+        if (finalMessage != null) {
+            context.emitChunk(finalMessage, EventType.FINAL_ANSWER.getValue());
+        }
+    }
 
     private void enqueueAgentReturn(GatewayCommand command, String status, Object replyData) {
         enqueueAgentReturn(command, new AgentTaskResult(status, "", replyData, Map.of(), Map.of()));

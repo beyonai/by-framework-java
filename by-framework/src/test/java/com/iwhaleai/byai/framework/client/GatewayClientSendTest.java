@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
+import com.iwhaleai.byai.framework.core.availability.RoutePolicy;
 import com.iwhaleai.byai.framework.core.protocol.ActionType;
 import com.iwhaleai.byai.framework.core.protocol.AskAgentCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
@@ -46,6 +47,9 @@ class GatewayClientSendTest {
     @BeforeEach
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
+        // AvailabilityRouter checks circuit breaker and quota before online check
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:circuit:"))).thenReturn(null);
+        lenient().when(jedis.get(startsWith("byai_gateway:control_plane:quota:"))).thenReturn(null);
     }
 
     @Test
@@ -105,7 +109,7 @@ class GatewayClientSendTest {
         GatewayClient.SendResponse response = client.sendMessage(
                 "demo-agent", "sess-1", "hello",
                 null, null, null, null, null, null, null, null,
-                "worker-1", true);
+                "worker-1", RoutePolicy.FAIL_FAST, 0, null, null);
 
         assertTrue(response.isSuccess());
         assertEquals("QUEUED", response.getStatus());
@@ -338,7 +342,7 @@ class GatewayClientSendTest {
         assertFalse(response.isSuccess());
         assertEquals("FAILED", response.getStatus());
         assertNotNull(response.getError());
-        assertTrue(response.getError().contains("No online worker found for agent_type"));
+        assertTrue(response.getError().contains("No online worker for agent_type"));
     }
 
     @Test
