@@ -1,10 +1,11 @@
 package com.iwhaleai.byai.framework.core.discovery;
 
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Pipeline;
 
 import java.util.Map;
 import java.util.UUID;
@@ -19,12 +20,26 @@ import java.util.concurrent.TimeUnit;
  */
 @Slf4j
 public class ServiceRegistry {
+    private final RedisOps redisOps;
+    /** Only used for local-IP detection fallback; null when constructed directly from RedisOps. */
     private final RedisClient redisClient;
     private ScheduledExecutorService scheduler;
     private ServiceInstance currentInstance;
     private String currentServiceName;
 
     public ServiceRegistry(RedisClient redisClient) {
+        this(redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient),
+                redisClient);
+    }
+
+    public ServiceRegistry(RedisOps redisOps) {
+        this(redisOps, null);
+    }
+
+    private ServiceRegistry(RedisOps redisOps, RedisClient redisClient) {
+        this.redisOps = redisOps;
         this.redisClient = redisClient;
     }
 
@@ -68,7 +83,9 @@ public class ServiceRegistry {
             Map<String, Object> metadata,
             int heartbeatIntervalSeconds) {
         if (host == null) {
-            host = DiscoveryUtils.getLocalIp(redisClient.getHost(), redisClient.getPort());
+            host = redisClient != null
+                    ? DiscoveryUtils.getLocalIp(redisClient.getHost(), redisClient.getPort())
+                    : DiscoveryUtils.getLocalIp();
         }
 
         String instanceId = serviceName + ":" + UUID.randomUUID().toString().substring(0, 8);
@@ -83,22 +100,11 @@ public class ServiceRegistry {
                 .build();
         this.currentServiceName = serviceName;
 
-        try (Jedis jedis = redisClient.getResource()) {
-            // 1. 写入实例详情
-            jedis.hset(
-                    Constants.RegistryKeys.sdInstanceDetails(serviceName),
-                    instanceId,
-                    currentInstance.toJson()
-            );
-            // 2. 写入活跃实例索引 (即使不发心跳，也需写入一次以保证可见性)
-            jedis.zadd(
-                    Constants.RegistryKeys.sdActiveInstances(serviceName),
-                    System.currentTimeMillis(),
-                    instanceId
-            );
-            // 3. 将服务名加入全局索引
-            jedis.sadd(Constants.RegistryKeys.sdServices(), serviceName);
-        }
+        // 1+2. 写入实例详情及活跃实例索引 (即使不发心跳，也需写入一次以保证可见性)
+        redisOps.registerServiceInstance(
+                serviceName, instanceId, currentInstance.toJson(), System.currentTimeMillis());
+        // 3. 将服务名加入全局索引
+        redisOps.sadd(Constants.RegistryKeys.sdServices(), serviceName);
 
         // 3. 立即触发首次心跳并启动循环（如果间隔 > 0）
         if (heartbeatIntervalSeconds > 0) {
@@ -192,19 +198,7 @@ public class ServiceRegistry {
         }
 
         if (currentInstance != null && currentServiceName != null) {
-            try (Jedis jedis = redisClient.getResource()) {
-                try (Pipeline pipe = jedis.pipelined()) {
-                    pipe.hdel(
-                            Constants.RegistryKeys.sdInstanceDetails(currentServiceName),
-                            currentInstance.getId()
-                    );
-                    pipe.zrem(
-                            Constants.RegistryKeys.sdActiveInstances(currentServiceName),
-                            currentInstance.getId()
-                    );
-                    pipe.sync();
-                }
-            }
+            redisOps.unregisterServiceInstance(currentServiceName, currentInstance.getId());
             log.info("Unregistered service instance: {}", currentInstance.getId());
             currentInstance = null;
             currentServiceName = null;
@@ -213,13 +207,8 @@ public class ServiceRegistry {
 
     private void sendHeartbeat() {
         if (currentInstance != null && currentServiceName != null) {
-            try (Jedis jedis = redisClient.getResource()) {
-                long now = System.currentTimeMillis();
-                jedis.zadd(
-                        Constants.RegistryKeys.sdActiveInstances(currentServiceName),
-                        now,
-                        currentInstance.getId()
-                );
+            try {
+                redisOps.heartbeatServiceInstance(currentServiceName, currentInstance.getId(), System.currentTimeMillis());
             } catch (Exception e) {
                 log.error("Failed to send heartbeat for service: {}", currentServiceName, e);
             }

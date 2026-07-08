@@ -3,6 +3,7 @@ package com.iwhaleai.byai.framework.common;
 import org.junit.jupiter.api.Test;
 import redis.clients.jedis.commands.JedisCommands;
 import redis.clients.jedis.params.SetParams;
+import redis.clients.jedis.resps.Tuple;
 
 import java.util.List;
 import java.util.Map;
@@ -147,5 +148,55 @@ abstract class RedisOpsContractTest {
 
         assertEquals(Map.of("lifecycle", "active"), result.get("w1"));
         assertEquals(Map.of(), result.get("w2"));
+    }
+
+    @Test
+    void registerServiceInstanceWritesDetailsAndActiveIndex() {
+        String detailsKey = Constants.RegistryKeys.sdInstanceDetails("svc");
+        String activeKey = Constants.RegistryKeys.sdActiveInstances("svc");
+
+        ops().registerServiceInstance("svc", "svc:1", "{\"id\":\"svc:1\"}", 1000L);
+
+        verify(redisCommandsMock()).hset(detailsKey, "svc:1", "{\"id\":\"svc:1\"}");
+        verify(redisCommandsMock()).zadd(activeKey, 1000d, "svc:1");
+    }
+
+    @Test
+    void heartbeatServiceInstanceRefreshesActiveIndexScore() {
+        String activeKey = Constants.RegistryKeys.sdActiveInstances("svc");
+
+        ops().heartbeatServiceInstance("svc", "svc:1", 2000L);
+
+        verify(redisCommandsMock()).zadd(activeKey, 2000d, "svc:1");
+    }
+
+    @Test
+    void unregisterServiceInstanceRemovesDetailsAndActiveIndexEntry() {
+        String detailsKey = Constants.RegistryKeys.sdInstanceDetails("svc");
+        String activeKey = Constants.RegistryKeys.sdActiveInstances("svc");
+
+        ops().unregisterServiceInstance("svc", "svc:1");
+
+        verify(redisCommandsMock()).hdel(detailsKey, "svc:1");
+        verify(redisCommandsMock()).zrem(activeKey, "svc:1");
+    }
+
+    @Test
+    void fetchActiveServiceInstancesReturnsPayloadAndHeartbeatPerInstance() {
+        String activeKey = Constants.RegistryKeys.sdActiveInstances("svc");
+        String detailsKey = Constants.RegistryKeys.sdInstanceDetails("svc");
+
+        Tuple tuple = mock(Tuple.class);
+        when(tuple.getElement()).thenReturn("svc:1");
+        when(tuple.getScore()).thenReturn(1500d);
+        when(redisCommandsMock().zrangeWithScores(activeKey, 0, -1)).thenReturn(List.of(tuple));
+        when(redisCommandsMock().hmget(detailsKey, "svc:1")).thenReturn(List.of("{\"id\":\"svc:1\"}"));
+
+        Map<String, RedisOps.ActiveInstanceRecord> result = ops().fetchActiveServiceInstances("svc");
+
+        assertEquals(1, result.size());
+        RedisOps.ActiveInstanceRecord record = result.get("svc:1");
+        assertEquals("{\"id\":\"svc:1\"}", record.instanceJson());
+        assertEquals(1500L, record.lastHeartbeatMs());
     }
 }
