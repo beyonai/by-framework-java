@@ -38,17 +38,28 @@ public class RedisConnectionConfig {
      * Load connection config from REDIS_MODE/REDIS_HOST/REDIS_PORT/REDIS_DB/
      * REDIS_USERNAME/REDIS_PASSWORD/REDIS_CLUSTER_NODES, via GatewayConfig
      * (system property checked before the real env var, then config file).
+     *
+     * REDIS_CLUSTER_HOST (comma-separated "host:port" list) is the preferred
+     * way to opt into Cluster mode: setting it alone is enough to switch to
+     * Cluster, no separate REDIS_MODE=cluster needed. It takes precedence
+     * over REDIS_CLUSTER_NODES/REDIS_MODE when REDIS_MODE isn't set
+     * explicitly, so the legacy explicit-mode configuration keeps working.
      */
     public static RedisConnectionConfig fromEnv() {
         RedisConnectionConfig config = new RedisConnectionConfig();
-        String modeStr = GatewayConfig.get("REDIS_MODE", "standalone");
+        String modeStr = GatewayConfig.get("REDIS_MODE");
+        String clusterHost = GatewayConfig.get("REDIS_CLUSTER_HOST");
+        if (modeStr == null) {
+            modeStr = clusterHost != null ? "cluster" : "standalone";
+        }
         config.mode = "cluster".equalsIgnoreCase(modeStr) ? Mode.CLUSTER : Mode.STANDALONE;
         config.host = GatewayConfig.get("REDIS_HOST", "localhost");
         config.port = GatewayConfig.getInt("REDIS_PORT", 6379);
         config.db = GatewayConfig.getInt("REDIS_DB", 0);
         config.username = GatewayConfig.get("REDIS_USERNAME");
         config.password = GatewayConfig.get("REDIS_PASSWORD");
-        config.clusterNodes = parseClusterNodes(GatewayConfig.get("REDIS_CLUSTER_NODES"));
+        String clusterNodesStr = clusterHost != null ? clusterHost : GatewayConfig.get("REDIS_CLUSTER_NODES");
+        config.clusterNodes = parseClusterNodes(clusterNodesStr);
         return config;
     }
 

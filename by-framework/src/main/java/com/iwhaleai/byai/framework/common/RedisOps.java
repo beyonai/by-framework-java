@@ -84,4 +84,39 @@ public interface RedisOps {
      * cross-node SCAN.
      */
     List<String> scanKeys(String pattern, int limit);
+
+    /**
+     * Write a service instance's detail hash entry and active-instance
+     * sorted-set entry. Both keys share the same {serviceName} hash tag
+     * (v2 schema), so this is always a single-slot write regardless of
+     * Cluster/standalone mode.
+     */
+    void registerServiceInstance(String serviceName, String instanceId, String instanceJson, long timestampMs);
+
+    /** Refresh a service instance's active-instance heartbeat timestamp. */
+    void heartbeatServiceInstance(String serviceName, String instanceId, long timestampMs);
+
+    /**
+     * Remove a service instance's detail hash entry and active-instance
+     * entry. Same-slot under Cluster like registerServiceInstance.
+     */
+    void unregisterServiceInstance(String serviceName, String instanceId);
+
+    /** One active service instance's raw detail payload and last heartbeat. */
+    record ActiveInstanceRecord(String instanceJson, long lastHeartbeatMs) {
+    }
+
+    /**
+     * Fetch every active instance's raw JSON payload keyed by instance ID,
+     * paired with its last-heartbeat timestamp. JSON parsing and
+     * health-threshold filtering stay in the discovery package - this only
+     * does the two same-slot Redis reads.
+     */
+    Map<String, ActiveInstanceRecord> fetchActiveServiceInstances(String serviceName);
+
+    /** RPUSH one value onto a list, returning the list's new length. */
+    long rpush(String key, String value);
+
+    /** ZADD one member at a score, returning the number of new members added. */
+    long zadd(String key, double score, String member);
 }

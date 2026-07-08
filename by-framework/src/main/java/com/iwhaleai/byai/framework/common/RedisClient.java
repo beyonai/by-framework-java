@@ -130,14 +130,19 @@ public class RedisClient {
         if (instance == null) {
             synchronized (RedisClient.class) {
                 if (instance == null) {
-                    // Use GatewayConfig to load from various sources
-                    String host = GatewayConfig.get("gateway.redis.host", "localhost");
-                    int port = GatewayConfig.getInt("gateway.redis.port", 6379);
-                    int db = GatewayConfig.getInt("gateway.redis.db", 0);
-                    String user = GatewayConfig.get("gateway.redis.username");
-                    String pass = GatewayConfig.get("gateway.redis.password");
-                    int timeout = GatewayConfig.getInt("gateway.redis.timeout", 5000);
-                    instance = new RedisClient(host, port, db, user, pass, timeout);
+                    RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+                    if (config.getMode() == RedisConnectionConfig.Mode.CLUSTER) {
+                        instance = new RedisClient(config);
+                    } else {
+                        // Use GatewayConfig to load from various sources
+                        String host = GatewayConfig.get("gateway.redis.host", "localhost");
+                        int port = GatewayConfig.getInt("gateway.redis.port", 6379);
+                        int db = GatewayConfig.getInt("gateway.redis.db", 0);
+                        String user = GatewayConfig.get("gateway.redis.username");
+                        String pass = GatewayConfig.get("gateway.redis.password");
+                        int timeout = GatewayConfig.getInt("gateway.redis.timeout", 5000);
+                        instance = new RedisClient(host, port, db, user, pass, timeout);
+                    }
                 }
             }
         }
@@ -157,6 +162,22 @@ public class RedisClient {
                 instance.close();
             }
             instance = new RedisClient(host, port, db, username, password, timeout);
+        }
+    }
+
+    /**
+     * Forced-reinit entry point for callers that need a fresh instance
+     * (mirroring the positional init() overloads above) but want
+     * config-driven Standalone/Cluster selection instead of always
+     * standalone - e.g. Spring apps that call init() instead of
+     * getInstance() to reset the pool on a DevTools restart.
+     */
+    public static void init(RedisConnectionConfig config) {
+        synchronized (RedisClient.class) {
+            if (instance != null) {
+                instance.close();
+            }
+            instance = new RedisClient(config);
         }
     }
 

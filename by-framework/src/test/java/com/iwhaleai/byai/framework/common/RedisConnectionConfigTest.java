@@ -26,6 +26,7 @@ class RedisConnectionConfigTest {
         System.clearProperty("REDIS_USERNAME");
         System.clearProperty("REDIS_PASSWORD");
         System.clearProperty("REDIS_CLUSTER_NODES");
+        System.clearProperty("REDIS_CLUSTER_HOST");
     }
 
     @Test
@@ -53,5 +54,31 @@ class RedisConnectionConfigTest {
         assertEquals(2, nodes.size());
         assertEquals(new HostAndPort("h1", 6379), nodes.get(0));
         assertEquals(new HostAndPort("h2", 6380), nodes.get(1));
+    }
+
+    @Test
+    void fromEnvClusterHostAloneImpliesClusterModeWithoutExplicitRedisMode() {
+        System.setProperty(
+                "REDIS_CLUSTER_HOST",
+                "10.10.168.203:6371,10.10.168.203:6372,10.10.168.203:6373");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(RedisConnectionConfig.Mode.CLUSTER, config.getMode());
+        List<HostAndPort> nodes = config.getClusterNodes();
+        assertEquals(3, nodes.size());
+        assertEquals(new HostAndPort("10.10.168.203", 6371), nodes.get(0));
+        assertEquals(new HostAndPort("10.10.168.203", 6372), nodes.get(1));
+        assertEquals(new HostAndPort("10.10.168.203", 6373), nodes.get(2));
+    }
+
+    @Test
+    void fromEnvExplicitRedisModeOverridesClusterHost() {
+        System.setProperty("REDIS_MODE", "standalone");
+        System.setProperty("REDIS_CLUSTER_HOST", "h1:6379");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(RedisConnectionConfig.Mode.STANDALONE, config.getMode());
     }
 }

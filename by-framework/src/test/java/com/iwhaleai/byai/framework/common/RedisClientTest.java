@@ -21,6 +21,9 @@ class RedisClientTest {
     @AfterEach
     void clearKeySchemaVersionProperty() {
         System.clearProperty("REDIS_KEY_SCHEMA_VERSION");
+        System.clearProperty("REDIS_MODE");
+        System.clearProperty("REDIS_CLUSTER_NODES");
+        resetSingleton();
     }
 
     @Test
@@ -52,6 +55,41 @@ class RedisClientTest {
             @SuppressWarnings("unchecked")
             Set<HostAndPort> nodesArg = (Set<HostAndPort>) capturedArgs.get(0);
             assertEquals(Set.of(new HostAndPort("h1", 6379), new HostAndPort("h2", 6380)), nodesArg);
+        }
+    }
+
+    @Test
+    void getInstanceInClusterModeWithoutV2SchemaFailsFast() {
+        // Given - reset singleton and configure cluster mode via the same
+        // env vars RedisConnectionConfig.fromEnv() reads, with no
+        // REDIS_KEY_SCHEMA_VERSION set (defaults to v1)
+        resetSingleton();
+        System.setProperty("REDIS_MODE", "cluster");
+        System.setProperty("REDIS_CLUSTER_NODES", "h1:6379");
+
+        // When/Then - the default init path must apply the same v2 guard
+        // as the RedisConnectionConfig constructor
+        assertThrows(IllegalStateException.class, RedisClient::getInstance);
+    }
+
+    @Test
+    void getInstanceInClusterModeWithV2SchemaBuildsClusterBackedInstance() {
+        // Given - reset singleton, configure cluster mode + the v2 schema
+        // it requires, same env vars RedisConnectionConfig.fromEnv() reads
+        resetSingleton();
+        System.setProperty("REDIS_MODE", "cluster");
+        System.setProperty("REDIS_CLUSTER_NODES", "h1:6379,h2:6380");
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v2");
+
+        try (MockedConstruction<JedisCluster> mocked = mockConstruction(JedisCluster.class)) {
+            // When
+            RedisClient instance = RedisClient.getInstance();
+
+            // Then - the default init path handed back a Cluster-backed
+            // client instead of silently falling back to standalone
+            assertEquals(1, mocked.constructed().size());
+            assertNotNull(instance.getJedisCluster());
+            assertSame(mocked.constructed().get(0), instance.getJedisCluster());
         }
     }
 
@@ -107,6 +145,30 @@ class RedisClientTest {
         RedisClient secondInstance = RedisClient.getInstance();
         assertNotNull(secondInstance);
         assertNotSame(firstInstance, secondInstance);
+    }
+
+    @Test
+    void initWithClusterConfigReplacesExistingInstanceWithClusterBackedOne() {
+        // Given - an existing standalone instance (e.g. from a prior init()
+        // call, mirroring the Spring DevTools forced-reinit use case)
+        resetSingleton();
+        RedisClient.init("localhost", 6379, 0, null, null);
+        RedisClient firstInstance = RedisClient.getInstance();
+
+        // When - forced reinit with a Cluster config, same v2 guard as the
+        // RedisConnectionConfig constructor
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v2");
+        RedisConnectionConfig config = new RedisConnectionConfig();
+        config.setMode(RedisConnectionConfig.Mode.CLUSTER);
+        config.setClusterNodes(List.of(new HostAndPort("h1", 6379)));
+
+        try (MockedConstruction<JedisCluster> mocked = mockConstruction(JedisCluster.class)) {
+            RedisClient.init(config);
+
+            RedisClient secondInstance = RedisClient.getInstance();
+            assertNotSame(firstInstance, secondInstance);
+            assertNotNull(secondInstance.getJedisCluster());
+        }
     }
 
     @Test

@@ -4,9 +4,11 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.params.ScanParams;
 import redis.clients.jedis.params.SetParams;
 import redis.clients.jedis.resps.ScanResult;
+import redis.clients.jedis.resps.Tuple;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -163,6 +165,68 @@ public class StandaloneRedisOps implements RedisOps {
             }
         }
         return result;
+    }
+
+    @Override
+    public void registerServiceInstance(String serviceName, String instanceId, String instanceJson, long timestampMs) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.hset(Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceId, instanceJson);
+            jedis.zadd(Constants.RegistryKeys.sdActiveInstances(serviceName), timestampMs, instanceId);
+        }
+    }
+
+    @Override
+    public void heartbeatServiceInstance(String serviceName, String instanceId, long timestampMs) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.zadd(Constants.RegistryKeys.sdActiveInstances(serviceName), timestampMs, instanceId);
+        }
+    }
+
+    @Override
+    public void unregisterServiceInstance(String serviceName, String instanceId) {
+        try (Jedis jedis = redisClient.getResource()) {
+            jedis.hdel(Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceId);
+            jedis.zrem(Constants.RegistryKeys.sdActiveInstances(serviceName), instanceId);
+        }
+    }
+
+    @Override
+    public Map<String, ActiveInstanceRecord> fetchActiveServiceInstances(String serviceName) {
+        try (Jedis jedis = redisClient.getResource()) {
+            List<Tuple> active = jedis.zrangeWithScores(
+                    Constants.RegistryKeys.sdActiveInstances(serviceName), 0, -1);
+            if (active.isEmpty()) {
+                return Map.of();
+            }
+
+            List<String> instanceIds = active.stream().map(Tuple::getElement).toList();
+            List<String> payloads = jedis.hmget(
+                    Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceIds.toArray(new String[0]));
+
+            Map<String, ActiveInstanceRecord> result = new LinkedHashMap<>();
+            for (int i = 0; i < active.size(); i++) {
+                String payload = payloads.get(i);
+                if (payload != null && !payload.isEmpty()) {
+                    result.put(instanceIds.get(i),
+                            new ActiveInstanceRecord(payload, (long) active.get(i).getScore()));
+                }
+            }
+            return result;
+        }
+    }
+
+    @Override
+    public long rpush(String key, String value) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.rpush(key, value);
+        }
+    }
+
+    @Override
+    public long zadd(String key, double score, String member) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.zadd(key, score, member);
+        }
     }
 
     @Override
