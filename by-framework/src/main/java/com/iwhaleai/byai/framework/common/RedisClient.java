@@ -130,14 +130,19 @@ public class RedisClient {
         if (instance == null) {
             synchronized (RedisClient.class) {
                 if (instance == null) {
-                    // Use GatewayConfig to load from various sources
-                    String host = GatewayConfig.get("gateway.redis.host", "localhost");
-                    int port = GatewayConfig.getInt("gateway.redis.port", 6379);
-                    int db = GatewayConfig.getInt("gateway.redis.db", 0);
-                    String user = GatewayConfig.get("gateway.redis.username");
-                    String pass = GatewayConfig.get("gateway.redis.password");
-                    int timeout = GatewayConfig.getInt("gateway.redis.timeout", 5000);
-                    instance = new RedisClient(host, port, db, user, pass, timeout);
+                    RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+                    if (config.getMode() == RedisConnectionConfig.Mode.CLUSTER) {
+                        instance = new RedisClient(config);
+                    } else {
+                        // Use GatewayConfig to load from various sources
+                        String host = GatewayConfig.get("gateway.redis.host", "localhost");
+                        int port = GatewayConfig.getInt("gateway.redis.port", 6379);
+                        int db = GatewayConfig.getInt("gateway.redis.db", 0);
+                        String user = GatewayConfig.get("gateway.redis.username");
+                        String pass = GatewayConfig.get("gateway.redis.password");
+                        int timeout = GatewayConfig.getInt("gateway.redis.timeout", 5000);
+                        instance = new RedisClient(host, port, db, user, pass, timeout);
+                    }
                 }
             }
         }
