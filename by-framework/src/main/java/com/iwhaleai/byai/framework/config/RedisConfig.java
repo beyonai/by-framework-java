@@ -4,6 +4,7 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Redis connection configuration.
@@ -12,6 +13,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@Slf4j
 public class RedisConfig {
 
     @Builder.Default
@@ -35,12 +37,15 @@ public class RedisConfig {
 
     /**
      * Create configuration from environment variables.
+     *
+     * REDIS_DATABASE replaces REDIS_DB (which still works as a deprecated
+     * fallback, logging a warning, during the transition period).
      */
     public static RedisConfig fromEnv() {
         RedisConfigBuilder builder = RedisConfig.builder()
                 .host(getEnv("REDIS_HOST", "localhost"))
                 .port(getEnvInt("REDIS_PORT", 6379))
-                .db(getEnvInt("REDIS_DB", 0))
+                .db(getEnvIntWithDeprecatedFallback("REDIS_DATABASE", "REDIS_DB", 0))
                 .password(getEnv("REDIS_PASSWORD", ""))
                 .username(getEnv("REDIS_USERNAME", null));
 
@@ -65,6 +70,25 @@ public class RedisConfig {
             } catch (NumberFormatException e) {
                 // ignore
             }
+        }
+        return defaultValue;
+    }
+
+    private static int getEnvIntWithDeprecatedFallback(String key, String deprecatedKey, int defaultValue) {
+        String value = System.getenv(key);
+        if (value == null) {
+            value = System.getenv(deprecatedKey);
+            if (value != null) {
+                log.warn("{} is deprecated, use {} instead", deprecatedKey, key);
+            }
+        }
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            // ignore
         }
         return defaultValue;
     }

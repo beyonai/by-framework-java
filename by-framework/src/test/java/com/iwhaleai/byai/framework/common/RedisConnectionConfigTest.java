@@ -22,6 +22,7 @@ class RedisConnectionConfigTest {
         System.clearProperty("REDIS_MODE");
         System.clearProperty("REDIS_HOST");
         System.clearProperty("REDIS_PORT");
+        System.clearProperty("REDIS_DATABASE");
         System.clearProperty("REDIS_DB");
         System.clearProperty("REDIS_USERNAME");
         System.clearProperty("REDIS_PASSWORD");
@@ -80,5 +81,33 @@ class RedisConnectionConfigTest {
         RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
 
         assertEquals(RedisConnectionConfig.Mode.STANDALONE, config.getMode());
+    }
+
+    @Test
+    void fromEnvReadsRedisDatabase() {
+        System.setProperty("REDIS_DATABASE", "3");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(3, config.getDb());
+    }
+
+    @Test
+    void fromEnvFallsBackToDeprecatedRedisDbWhenRedisDatabaseUnset() {
+        System.setProperty("REDIS_DB", "5");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(5, config.getDb());
+    }
+
+    @Test
+    void fromEnvRedisDatabaseTakesPrecedenceOverDeprecatedRedisDb() {
+        System.setProperty("REDIS_DATABASE", "2");
+        System.setProperty("REDIS_DB", "9");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(2, config.getDb());
     }
 }

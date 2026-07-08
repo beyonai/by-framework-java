@@ -11,13 +11,25 @@ public class Constants {
     /**
      * Return the configured Redis key schema version ("v1" or "v2").
      *
-     * <p>Controlled by REDIS_KEY_SCHEMA_VERSION, defaulting to "v1" (the
-     * current unprefixed key format). Cluster mode requires "v2" (see
-     * RedisClient's fail-fast check).
+     * <p>Controlled by REDIS_KEY_SCHEMA_VERSION, which always wins when set
+     * explicitly. When it isn't set, REDIS_CLUSTER_HOST being configured
+     * implies "v2" (Cluster mode requires v2 - v1 keys have no hash tags
+     * and hit CROSSSLOT errors under Cluster); otherwise it defaults to "v1"
+     * (the legacy unprefixed key format). This mirrors
+     * RedisConnectionConfig.fromEnv()'s REDIS_MODE/REDIS_CLUSTER_HOST
+     * precedence, but deliberately does NOT infer "v2" from an explicit
+     * REDIS_MODE=cluster alone (without REDIS_CLUSTER_HOST) - that legacy
+     * explicit-mode path still requires REDIS_KEY_SCHEMA_VERSION=v2 to be
+     * set by hand, and RedisClient's fail-fast check continues to guard it.
      */
     public static String getKeySchemaVersion() {
         String version = com.iwhaleai.byai.framework.config.GatewayConfig.get(
-                "REDIS_KEY_SCHEMA_VERSION", "v1");
+                "REDIS_KEY_SCHEMA_VERSION");
+        if (version == null) {
+            boolean clusterHostConfigured = com.iwhaleai.byai.framework.config.GatewayConfig.get(
+                    "REDIS_CLUSTER_HOST") != null;
+            version = clusterHostConfigured ? "v2" : "v1";
+        }
         if (!"v1".equals(version) && !"v2".equals(version)) {
             throw new IllegalArgumentException(
                     "Invalid REDIS_KEY_SCHEMA_VERSION: " + version + " (must be 'v1' or 'v2')");

@@ -17,6 +17,7 @@ class ConstantsTest {
     @AfterEach
     void clearKeySchemaVersionProperty() {
         System.clearProperty("REDIS_KEY_SCHEMA_VERSION");
+        System.clearProperty("REDIS_CLUSTER_HOST");
     }
 
     @Test
@@ -34,6 +35,26 @@ class ConstantsTest {
     void keySchemaVersionRejectsInvalidValue() {
         System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v3");
         assertThrows(IllegalArgumentException.class, Constants::getKeySchemaVersion);
+    }
+
+    @Test
+    void keySchemaVersionDefaultsToV2WhenClusterHostSet() {
+        // No explicit REDIS_KEY_SCHEMA_VERSION: REDIS_CLUSTER_HOST alone is
+        // enough to imply v2, mirroring RedisConnectionConfig.fromEnv()'s
+        // mode inference.
+        System.setProperty("REDIS_CLUSTER_HOST", "h1:6379,h2:6380");
+        assertEquals("v2", Constants.getKeySchemaVersion());
+    }
+
+    @Test
+    void keySchemaVersionExplicitValueWinsOverClusterHost() {
+        // An explicit REDIS_KEY_SCHEMA_VERSION always wins, even if it
+        // contradicts REDIS_CLUSTER_HOST's implied v2 - RedisClient's
+        // fail-fast check is what catches this combination at construction
+        // time, not silent auto-correction here.
+        System.setProperty("REDIS_CLUSTER_HOST", "h1:6379");
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v1");
+        assertEquals("v1", Constants.getKeySchemaVersion());
     }
 
     @Test

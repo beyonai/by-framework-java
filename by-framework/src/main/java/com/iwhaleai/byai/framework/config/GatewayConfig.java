@@ -62,8 +62,13 @@ public class GatewayConfig {
                 return value;
             }
         } else if ("gateway.redis.db".equals(key)) {
+            value = System.getenv("REDIS_DATABASE");
+            if (value != null) {
+                return value;
+            }
             value = System.getenv("REDIS_DB");
             if (value != null) {
+                log.warn("REDIS_DB is deprecated, use REDIS_DATABASE instead");
                 return value;
             }
         } else if ("gateway.redis.username".equals(key)) {
@@ -84,6 +89,32 @@ public class GatewayConfig {
 
     public static int getInt(String key, int defaultValue) {
         String value = get(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            log.warn("Failed to parse config {} as int: {}", key, value);
+            return defaultValue;
+        }
+    }
+
+    /**
+     * Like {@link #getInt(String, int)}, but if {@code key} isn't set, falls
+     * back to {@code deprecatedKey} (logging a deprecation warning) before
+     * falling back to {@code defaultValue}. Used for renamed config keys
+     * during a compatibility transition period (e.g. REDIS_DATABASE
+     * replacing REDIS_DB).
+     */
+    public static int getIntWithDeprecatedFallback(String key, String deprecatedKey, int defaultValue) {
+        String value = get(key);
+        if (value == null) {
+            value = get(deprecatedKey);
+            if (value != null) {
+                log.warn("{} is deprecated, use {} instead", deprecatedKey, key);
+            }
+        }
         if (value == null) {
             return defaultValue;
         }
