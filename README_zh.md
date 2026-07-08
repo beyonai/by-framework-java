@@ -184,6 +184,8 @@ client.sendMessage("chat_agent", "session-123", "北京今天天气如何？", "
 
 Cluster 模式要求 `REDIS_KEY_SCHEMA_VERSION=v2`——v1 key 格式没有 Cluster hash tag，在 Cluster 下会触发 `CROSSSLOT` 错误。若选择 Cluster 模式但未设置 v2，`RedisClient` 会在构造时立即失败（不会尝试任何网络 I/O）。
 
+需要强制刷新实例而非使用 `getInstance()` 懒加载单例的调用方（例如在框架重启时重置连接池），可以使用 `RedisClient.init(RedisConnectionConfig)`——与 `getInstance()` 相同的单机/集群选择逻辑和 v2 校验，但会像 `init(host, port, ...)` 系列重载一样，始终替换当前实例。
+
 ---
 
 ## 📄 许可证

@@ -148,6 +148,30 @@ class RedisClientTest {
     }
 
     @Test
+    void initWithClusterConfigReplacesExistingInstanceWithClusterBackedOne() {
+        // Given - an existing standalone instance (e.g. from a prior init()
+        // call, mirroring the Spring DevTools forced-reinit use case)
+        resetSingleton();
+        RedisClient.init("localhost", 6379, 0, null, null);
+        RedisClient firstInstance = RedisClient.getInstance();
+
+        // When - forced reinit with a Cluster config, same v2 guard as the
+        // RedisConnectionConfig constructor
+        System.setProperty("REDIS_KEY_SCHEMA_VERSION", "v2");
+        RedisConnectionConfig config = new RedisConnectionConfig();
+        config.setMode(RedisConnectionConfig.Mode.CLUSTER);
+        config.setClusterNodes(List.of(new HostAndPort("h1", 6379)));
+
+        try (MockedConstruction<JedisCluster> mocked = mockConstruction(JedisCluster.class)) {
+            RedisClient.init(config);
+
+            RedisClient secondInstance = RedisClient.getInstance();
+            assertNotSame(firstInstance, secondInstance);
+            assertNotNull(secondInstance.getJedisCluster());
+        }
+    }
+
+    @Test
     void closeHandlesNullPool() {
         // Given
         resetSingleton();

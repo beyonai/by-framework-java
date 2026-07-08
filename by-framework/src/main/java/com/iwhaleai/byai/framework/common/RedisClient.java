@@ -165,6 +165,22 @@ public class RedisClient {
         }
     }
 
+    /**
+     * Forced-reinit entry point for callers that need a fresh instance
+     * (mirroring the positional init() overloads above) but want
+     * config-driven Standalone/Cluster selection instead of always
+     * standalone - e.g. Spring apps that call init() instead of
+     * getInstance() to reset the pool on a DevTools restart.
+     */
+    public static void init(RedisConnectionConfig config) {
+        synchronized (RedisClient.class) {
+            if (instance != null) {
+                instance.close();
+            }
+            instance = new RedisClient(config);
+        }
+    }
+
     public Jedis getResource() {
         return jedisPool.getResource();
     }
