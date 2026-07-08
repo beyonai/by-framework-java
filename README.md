@@ -167,12 +167,13 @@ client.sendMessage("chat_agent", "session-123", "How is the weather?", "tenant-0
 
 ### Redis Cluster mode
 
-`RedisClient.getInstance()` (the default init path used by `ByaiWorker`/`GatewayClient` when no explicit `RedisClient` is passed in) can connect to a Redis Cluster instead of standalone Redis. It stays standalone by default — Cluster mode only activates when `REDIS_MODE=cluster` is set — so existing `gateway.redis.*` users are unaffected.
+`RedisClient.getInstance()` (the default init path used by `ByaiWorker`/`GatewayClient` when no explicit `RedisClient` is passed in) can connect to a Redis Cluster instead of standalone Redis. It stays standalone by default — Cluster mode activates when `REDIS_MODE=cluster` is set explicitly, or simply by setting `REDIS_CLUSTER_HOST` — so existing `gateway.redis.*` users are unaffected.
 
 | Environment Variable | Description | Default |
 | :--- | :--- | :--- |
-| `REDIS_MODE` | `standalone` or `cluster` | `standalone` |
-| `REDIS_CLUSTER_NODES` | Comma-separated `host:port` list of Cluster nodes, e.g. `h1:6379,h2:6379` | *(empty)* |
+| `REDIS_MODE` | `standalone` or `cluster`; if unset, inferred as `cluster` when `REDIS_CLUSTER_HOST` is set | `standalone` |
+| `REDIS_CLUSTER_HOST` | Comma-separated `host:port` list of Cluster nodes, e.g. `h1:6379,h2:6379`; setting it alone is enough to switch to Cluster mode | *(empty)* |
+| `REDIS_CLUSTER_NODES` | Same format as `REDIS_CLUSTER_HOST`, used when `REDIS_CLUSTER_HOST` isn't set | *(empty)* |
 | `REDIS_USERNAME` / `REDIS_PASSWORD` | Cluster auth credentials | *(none)* |
 | `REDIS_KEY_SCHEMA_VERSION` | Must be `v2` to use Cluster mode | `v1` |
 

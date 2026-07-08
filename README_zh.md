@@ -173,12 +173,13 @@ client.sendMessage("chat_agent", "session-123", "北京今天天气如何？", "
 
 ### Redis Cluster 模式
 
-`RedisClient.getInstance()`（`ByaiWorker`/`GatewayClient` 在未显式传入 `RedisClient` 时使用的默认初始化路径）可以连接 Redis Cluster 而非单机 Redis。默认仍为单机模式——只有设置 `REDIS_MODE=cluster` 才会启用 Cluster 模式，因此现有 `gateway.redis.*` 用户不受影响。
+`RedisClient.getInstance()`（`ByaiWorker`/`GatewayClient` 在未显式传入 `RedisClient` 时使用的默认初始化路径）可以连接 Redis Cluster 而非单机 Redis。默认仍为单机模式——设置 `REDIS_MODE=cluster`，或者只配置 `REDIS_CLUSTER_HOST`，都会启用 Cluster 模式，因此现有 `gateway.redis.*` 用户不受影响。
 
 | 环境变量 | 描述 | 默认值 |
 | :--- | :--- | :--- |
-| `REDIS_MODE` | `standalone` 或 `cluster` | `standalone` |
-| `REDIS_CLUSTER_NODES` | 逗号分隔的 `host:port` 节点列表，例如 `h1:6379,h2:6379` | *(空)* |
+| `REDIS_MODE` | `standalone` 或 `cluster`；未设置时，若配置了 `REDIS_CLUSTER_HOST` 则自动推断为 `cluster` | `standalone` |
+| `REDIS_CLUSTER_HOST` | 逗号分隔的 `host:port` 节点列表，例如 `h1:6379,h2:6379`；只要配置了这个变量就足以切换到 Cluster 模式 | *(空)* |
+| `REDIS_CLUSTER_NODES` | 格式同 `REDIS_CLUSTER_HOST`，在未设置 `REDIS_CLUSTER_HOST` 时使用 | *(空)* |
 | `REDIS_USERNAME` / `REDIS_PASSWORD` | Cluster 认证凭据 | *(无)* |
 | `REDIS_KEY_SCHEMA_VERSION` | 必须为 `v2` 才能使用 Cluster 模式 | `v1` |
 
