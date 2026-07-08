@@ -171,6 +171,19 @@ client.sendMessage("chat_agent", "session-123", "北京今天天气如何？", "
 | `gateway.redis.port` | `REDIS_PORT` | Redis 端口 | `6379` |
 | `gateway.worker.concurrency` | `WORKER_CONCURRENCY` | Worker 最大并发数 | `50` |
 
+### Redis Cluster 模式
+
+`RedisClient.getInstance()`（`ByaiWorker`/`GatewayClient` 在未显式传入 `RedisClient` 时使用的默认初始化路径）可以连接 Redis Cluster 而非单机 Redis。默认仍为单机模式——只有设置 `REDIS_MODE=cluster` 才会启用 Cluster 模式，因此现有 `gateway.redis.*` 用户不受影响。
+
+| 环境变量 | 描述 | 默认值 |
+| :--- | :--- | :--- |
+| `REDIS_MODE` | `standalone` 或 `cluster` | `standalone` |
+| `REDIS_CLUSTER_NODES` | 逗号分隔的 `host:port` 节点列表，例如 `h1:6379,h2:6379` | *(空)* |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | Cluster 认证凭据 | *(无)* |
+| `REDIS_KEY_SCHEMA_VERSION` | 必须为 `v2` 才能使用 Cluster 模式 | `v1` |
+
+Cluster 模式要求 `REDIS_KEY_SCHEMA_VERSION=v2`——v1 key 格式没有 Cluster hash tag，在 Cluster 下会触发 `CROSSSLOT` 错误。若选择 Cluster 模式但未设置 v2，`RedisClient` 会在构造时立即失败（不会尝试任何网络 I/O）。
+
 ---
 
 ## 📄 许可证
