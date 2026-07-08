@@ -199,4 +199,16 @@ abstract class RedisOpsContractTest {
         assertEquals("{\"id\":\"svc:1\"}", record.instanceJson());
         assertEquals(1500L, record.lastHeartbeatMs());
     }
+
+    @Test
+    void rpushDelegates() {
+        when(redisCommandsMock().rpush("k", "v")).thenReturn(1L);
+        assertEquals(1L, ops().rpush("k", "v"));
+    }
+
+    @Test
+    void zaddDelegates() {
+        when(redisCommandsMock().zadd("k", 1.5d, "m")).thenReturn(1L);
+        assertEquals(1L, ops().zadd("k", 1.5d, "m"));
+    }
 }

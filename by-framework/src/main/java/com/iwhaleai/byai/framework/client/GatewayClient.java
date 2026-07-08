@@ -1,10 +1,12 @@
 package com.iwhaleai.byai.framework.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
 import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.common.RedisStreamOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
 import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
 import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
@@ -78,7 +80,11 @@ public class GatewayClient<T> {
         this.registry = registry;
         this.interceptors = interceptors != null ? interceptors : new ArrayList<>();
         this.clientDispatchTracer = clientDispatchTracer;
-        this.redisTraceWriter = new RedisTraceWriter(redisClient, objectMapper);
+        this.redisTraceWriter = new RedisTraceWriter(
+                redisClient.getJedisCluster() != null
+                        ? new ClusterRedisOps(redisClient.getJedisCluster())
+                        : new StandaloneRedisOps(redisClient),
+                objectMapper);
         this.availabilityRouter = new AvailabilityRouter(redisClient, registry);
     }
 

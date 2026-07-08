@@ -216,6 +216,20 @@ public class StandaloneRedisOps implements RedisOps {
     }
 
     @Override
+    public long rpush(String key, String value) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.rpush(key, value);
+        }
+    }
+
+    @Override
+    public long zadd(String key, double score, String member) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.zadd(key, score, member);
+        }
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         List<String> result = new ArrayList<>();
         ScanParams params = new ScanParams().match(pattern).count(100);

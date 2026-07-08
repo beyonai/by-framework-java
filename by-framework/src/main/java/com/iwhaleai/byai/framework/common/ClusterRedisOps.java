@@ -182,6 +182,16 @@ public class ClusterRedisOps implements RedisOps {
     }
 
     @Override
+    public long rpush(String key, String value) {
+        return jedisCluster.rpush(key, value);
+    }
+
+    @Override
+    public long zadd(String key, double score, String member) {
+        return jedisCluster.zadd(key, score, member);
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         Set<String> result = new LinkedHashSet<>();
         ScanParams params = new ScanParams().match(pattern).count(100);

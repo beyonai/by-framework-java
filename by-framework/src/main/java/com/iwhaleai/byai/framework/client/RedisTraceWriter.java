@@ -2,9 +2,8 @@ package com.iwhaleai.byai.framework.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iwhaleai.byai.framework.common.Constants;
-import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -13,11 +12,11 @@ import java.util.Map;
 class RedisTraceWriter {
     private static final String CLIENT_DISPATCH = "client.dispatch";
 
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
     private final ObjectMapper objectMapper;
 
-    RedisTraceWriter(RedisClient redisClient, ObjectMapper objectMapper) {
-        this.redisClient = redisClient;
+    RedisTraceWriter(RedisOps redisOps, ObjectMapper objectMapper) {
+        this.redisOps = redisOps;
         this.objectMapper = objectMapper;
     }
 
@@ -38,11 +37,11 @@ class RedisTraceWriter {
         // undo the trace_meta/trace_spans write that already landed above
         // (in particular, it must not skip their TTL, which used to happen
         // when everything shared one try/catch).
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.hset(traceKey, traceMeta(record));
-            jedis.rpush(spanKey, objectMapper.writeValueAsString(span(record)));
-            jedis.expire(traceKey, Constants.TRACE_TTL_SECONDS);
-            jedis.expire(spanKey, Constants.TRACE_TTL_SECONDS);
+        try {
+            redisOps.hsetAll(traceKey, traceMeta(record));
+            redisOps.rpush(spanKey, objectMapper.writeValueAsString(span(record)));
+            redisOps.expire(traceKey, Constants.TRACE_TTL_SECONDS);
+            redisOps.expire(spanKey, Constants.TRACE_TTL_SECONDS);
         } catch (Exception e) {
             log.warn("Redis client.dispatch trace write skipped: {}", e.getMessage());
             return;
@@ -102,9 +101,9 @@ class RedisTraceWriter {
         if (isBlank(key) || isBlank(traceId) || key.endsWith(":")) {
             return;
         }
-        try (Jedis jedis = redisClient.getResource()) {
-            jedis.zadd(key, score, traceId);
-            jedis.expire(key, Constants.TRACE_TTL_SECONDS);
+        try {
+            redisOps.zadd(key, score, traceId);
+            redisOps.expire(key, Constants.TRACE_TTL_SECONDS);
         } catch (Exception e) {
             log.warn("RedisTraceWriter: trace index write failed for {}: {}", key, e.getMessage());
         }
