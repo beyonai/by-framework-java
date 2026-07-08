@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.iwhaleai.byai</groupId>
         <artifactId>by-framework-parent</artifactId>
-        <version>0.2.9-SNAPSHOT</version>
+        <version>0.2.10-SNAPSHOT</version>
     </parent>
 
     <artifactId>by-framework</artifactId>
