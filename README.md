@@ -178,6 +178,8 @@ client.sendMessage("chat_agent", "session-123", "How is the weather?", "tenant-0
 
 Cluster mode requires `REDIS_KEY_SCHEMA_VERSION=v2` — the v1 key layout has no Cluster hash tags and hits `CROSSSLOT` errors under Cluster. `RedisClient` fails fast at construction time (no network I/O attempted) if Cluster mode is selected without v2.
 
+Callers that force a fresh instance instead of using the lazy `getInstance()` singleton (e.g. resetting the connection pool on a framework restart) can use `RedisClient.init(RedisConnectionConfig)` — same Standalone/Cluster selection and v2 guard as `getInstance()`, but always replaces the current instance like the positional `init(host, port, ...)` overloads.
+
 ---
 
 ## 📄 License
