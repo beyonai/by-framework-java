@@ -113,4 +113,10 @@ public interface RedisOps {
      * does the two same-slot Redis reads.
      */
     Map<String, ActiveInstanceRecord> fetchActiveServiceInstances(String serviceName);
+
+    /** RPUSH one value onto a list, returning the list's new length. */
+    long rpush(String key, String value);
+
+    /** ZADD one member at a score, returning the number of new members added. */
+    long zadd(String key, double score, String member);
 }
