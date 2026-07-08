@@ -163,6 +163,7 @@ client.sendMessage("chat_agent", "session-123", "How is the weather?", "tenant-0
 | :--- | :--- | :--- | :--- |
 | `gateway.redis.host` | `REDIS_HOST` | Redis server address | `localhost` |
 | `gateway.redis.port` | `REDIS_PORT` | Redis port | `6379` |
+| `gateway.redis.db` | `REDIS_DATABASE` (`REDIS_DB` still works as a deprecated fallback, logs a warning) | Redis database index | `0` |
 | `gateway.worker.concurrency` | `WORKER_CONCURRENCY` | Maximum worker concurrency | `50` |
 
 ### Redis Cluster mode
@@ -175,9 +176,9 @@ client.sendMessage("chat_agent", "session-123", "How is the weather?", "tenant-0
 | `REDIS_CLUSTER_HOST` | Comma-separated `host:port` list of Cluster nodes, e.g. `h1:6379,h2:6379`; setting it alone is enough to switch to Cluster mode | *(empty)* |
 | `REDIS_CLUSTER_NODES` | Same format as `REDIS_CLUSTER_HOST`, used when `REDIS_CLUSTER_HOST` isn't set | *(empty)* |
 | `REDIS_USERNAME` / `REDIS_PASSWORD` | Cluster auth credentials | *(none)* |
-| `REDIS_KEY_SCHEMA_VERSION` | Must be `v2` to use Cluster mode | `v1` |
+| `REDIS_KEY_SCHEMA_VERSION` | `v1` or `v2`; required to be `v2` for Cluster mode. If unset, automatically inferred as `v2` when `REDIS_CLUSTER_HOST` is set (an explicit value always wins) | `v1`, or `v2` when `REDIS_CLUSTER_HOST` is set |
 
-Cluster mode requires `REDIS_KEY_SCHEMA_VERSION=v2` — the v1 key layout has no Cluster hash tags and hits `CROSSSLOT` errors under Cluster. `RedisClient` fails fast at construction time (no network I/O attempted) if Cluster mode is selected without v2.
+Cluster mode requires key schema `v2` — the v1 key layout has no Cluster hash tags and hits `CROSSSLOT` errors under Cluster. Setting `REDIS_CLUSTER_HOST` alone now takes care of this automatically; the older `REDIS_MODE=cluster` + `REDIS_CLUSTER_NODES` combo still requires `REDIS_KEY_SCHEMA_VERSION=v2` to be set explicitly. `RedisClient` fails fast at construction time (no network I/O attempted) if Cluster mode is selected without v2.
 
 Callers that force a fresh instance instead of using the lazy `getInstance()` singleton (e.g. resetting the connection pool on a framework restart) can use `RedisClient.init(RedisConnectionConfig)` — same Standalone/Cluster selection and v2 guard as `getInstance()`, but always replaces the current instance like the positional `init(host, port, ...)` overloads.
 

@@ -35,15 +35,19 @@ public class RedisConnectionConfig {
     private List<HostAndPort> clusterNodes = new ArrayList<>();
 
     /**
-     * Load connection config from REDIS_MODE/REDIS_HOST/REDIS_PORT/REDIS_DB/
-     * REDIS_USERNAME/REDIS_PASSWORD/REDIS_CLUSTER_NODES, via GatewayConfig
-     * (system property checked before the real env var, then config file).
+     * Load connection config from REDIS_MODE/REDIS_HOST/REDIS_PORT/
+     * REDIS_DATABASE/REDIS_USERNAME/REDIS_PASSWORD/REDIS_CLUSTER_NODES, via
+     * GatewayConfig (system property checked before the real env var, then
+     * config file).
      *
      * REDIS_CLUSTER_HOST (comma-separated "host:port" list) is the preferred
      * way to opt into Cluster mode: setting it alone is enough to switch to
      * Cluster, no separate REDIS_MODE=cluster needed. It takes precedence
      * over REDIS_CLUSTER_NODES/REDIS_MODE when REDIS_MODE isn't set
      * explicitly, so the legacy explicit-mode configuration keeps working.
+     *
+     * REDIS_DATABASE replaces REDIS_DB (which still works as a deprecated
+     * fallback, logging a warning, during the transition period).
      */
     public static RedisConnectionConfig fromEnv() {
         RedisConnectionConfig config = new RedisConnectionConfig();
@@ -55,7 +59,7 @@ public class RedisConnectionConfig {
         config.mode = "cluster".equalsIgnoreCase(modeStr) ? Mode.CLUSTER : Mode.STANDALONE;
         config.host = GatewayConfig.get("REDIS_HOST", "localhost");
         config.port = GatewayConfig.getInt("REDIS_PORT", 6379);
-        config.db = GatewayConfig.getInt("REDIS_DB", 0);
+        config.db = GatewayConfig.getIntWithDeprecatedFallback("REDIS_DATABASE", "REDIS_DB", 0);
         config.username = GatewayConfig.get("REDIS_USERNAME");
         config.password = GatewayConfig.get("REDIS_PASSWORD");
         String clusterNodesStr = clusterHost != null ? clusterHost : GatewayConfig.get("REDIS_CLUSTER_NODES");

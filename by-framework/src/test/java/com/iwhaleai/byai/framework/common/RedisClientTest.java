@@ -23,6 +23,7 @@ class RedisClientTest {
         System.clearProperty("REDIS_KEY_SCHEMA_VERSION");
         System.clearProperty("REDIS_MODE");
         System.clearProperty("REDIS_CLUSTER_NODES");
+        System.clearProperty("REDIS_CLUSTER_HOST");
         resetSingleton();
     }
 
@@ -87,6 +88,25 @@ class RedisClientTest {
 
             // Then - the default init path handed back a Cluster-backed
             // client instead of silently falling back to standalone
+            assertEquals(1, mocked.constructed().size());
+            assertNotNull(instance.getJedisCluster());
+            assertSame(mocked.constructed().get(0), instance.getJedisCluster());
+        }
+    }
+
+    @Test
+    void getInstanceWithClusterHostAloneBuildsClusterBackedInstanceWithoutExplicitV2Schema() {
+        // Given - reset singleton, configure only REDIS_CLUSTER_HOST (no
+        // REDIS_MODE, no REDIS_KEY_SCHEMA_VERSION): both mode and key schema
+        // version should be inferred automatically.
+        resetSingleton();
+        System.setProperty("REDIS_CLUSTER_HOST", "h1:6379,h2:6380");
+
+        try (MockedConstruction<JedisCluster> mocked = mockConstruction(JedisCluster.class)) {
+            // When
+            RedisClient instance = RedisClient.getInstance();
+
+            // Then - no fail-fast, a Cluster-backed instance was built
             assertEquals(1, mocked.constructed().size());
             assertNotNull(instance.getJedisCluster());
             assertSame(mocked.constructed().get(0), instance.getJedisCluster());

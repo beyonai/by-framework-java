@@ -169,6 +169,7 @@ client.sendMessage("chat_agent", "session-123", "北京今天天气如何？", "
 | :--- | :--- | :--- | :--- |
 | `gateway.redis.host` | `REDIS_HOST` | Redis 服务器地址 | `localhost` |
 | `gateway.redis.port` | `REDIS_PORT` | Redis 端口 | `6379` |
+| `gateway.redis.db` | `REDIS_DATABASE`（`REDIS_DB` 作为过期兼容 fallback 仍可用，会打印一条 warning 日志） | Redis 数据库索引 | `0` |
 | `gateway.worker.concurrency` | `WORKER_CONCURRENCY` | Worker 最大并发数 | `50` |
 
 ### Redis Cluster 模式
@@ -181,9 +182,9 @@ client.sendMessage("chat_agent", "session-123", "北京今天天气如何？", "
 | `REDIS_CLUSTER_HOST` | 逗号分隔的 `host:port` 节点列表，例如 `h1:6379,h2:6379`；只要配置了这个变量就足以切换到 Cluster 模式 | *(空)* |
 | `REDIS_CLUSTER_NODES` | 格式同 `REDIS_CLUSTER_HOST`，在未设置 `REDIS_CLUSTER_HOST` 时使用 | *(空)* |
 | `REDIS_USERNAME` / `REDIS_PASSWORD` | Cluster 认证凭据 | *(无)* |
-| `REDIS_KEY_SCHEMA_VERSION` | 必须为 `v2` 才能使用 Cluster 模式 | `v1` |
+| `REDIS_KEY_SCHEMA_VERSION` | `v1` 或 `v2`；Cluster 模式要求为 `v2`。未显式设置时，只要配置了 `REDIS_CLUSTER_HOST` 就会自动推断为 `v2`（显式设置的值始终优先） | `v1`，配置了 `REDIS_CLUSTER_HOST` 时为 `v2` |
 
-Cluster 模式要求 `REDIS_KEY_SCHEMA_VERSION=v2`——v1 key 格式没有 Cluster hash tag，在 Cluster 下会触发 `CROSSSLOT` 错误。若选择 Cluster 模式但未设置 v2，`RedisClient` 会在构造时立即失败（不会尝试任何网络 I/O）。
+Cluster 模式要求 key schema 为 `v2`——v1 key 格式没有 Cluster hash tag，在 Cluster 下会触发 `CROSSSLOT` 错误。现在只要设置了 `REDIS_CLUSTER_HOST`，这一项会自动处理好；走老式 `REDIS_MODE=cluster` + `REDIS_CLUSTER_NODES` 组合的用户，仍然需要显式设置 `REDIS_KEY_SCHEMA_VERSION=v2`。若选择 Cluster 模式但最终 key schema 不是 v2，`RedisClient` 会在构造时立即失败（不会尝试任何网络 I/O）。
 
 需要强制刷新实例而非使用 `getInstance()` 懒加载单例的调用方（例如在框架重启时重置连接池），可以使用 `RedisClient.init(RedisConnectionConfig)`——与 `getInstance()` 相同的单机/集群选择逻辑和 v2 校验，但会像 `init(host, port, ...)` 系列重载一样，始终替换当前实例。
 

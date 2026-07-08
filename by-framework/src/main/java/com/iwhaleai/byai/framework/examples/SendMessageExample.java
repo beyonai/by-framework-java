@@ -17,7 +17,7 @@ public class SendMessageExample {
     public static void main(String[] args) {
         // 1. 初始化 Redis 客户端。
         // RedisClient.getInstance() 会自动从环境变量读取配置：
-        // REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD
+        // REDIS_HOST, REDIS_PORT, REDIS_DATABASE, REDIS_USERNAME, REDIS_PASSWORD
         // 如果环境变量未设置，默认连接 localhost:6379, db 0
         RedisClient redisClient = RedisClient.getInstance();
 

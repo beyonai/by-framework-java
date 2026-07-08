@@ -86,6 +86,39 @@ class GatewayConfigTest {
     }
 
     @Test
+    void getIntWithDeprecatedFallbackPrefersNewKey() {
+        System.setProperty("test.new.db.key", "3");
+        System.setProperty("test.old.db.key", "9");
+        try {
+            int result = GatewayConfig.getIntWithDeprecatedFallback(
+                    "test.new.db.key", "test.old.db.key", 0);
+            assertEquals(3, result);
+        } finally {
+            System.clearProperty("test.new.db.key");
+            System.clearProperty("test.old.db.key");
+        }
+    }
+
+    @Test
+    void getIntWithDeprecatedFallbackFallsBackToOldKeyWhenNewKeyUnset() {
+        System.setProperty("test.old.db.key", "5");
+        try {
+            int result = GatewayConfig.getIntWithDeprecatedFallback(
+                    "test.new.db.key", "test.old.db.key", 0);
+            assertEquals(5, result);
+        } finally {
+            System.clearProperty("test.old.db.key");
+        }
+    }
+
+    @Test
+    void getIntWithDeprecatedFallbackReturnsDefaultWhenNeitherKeySet() {
+        int result = GatewayConfig.getIntWithDeprecatedFallback(
+                "test.new.db.key", "test.old.db.key", 42);
+        assertEquals(42, result);
+    }
+
+    @Test
     void redisConfigDefaultValues() {
         // Verify default values for Redis config keys when nothing is set
         // Clear any system properties that might interfere
