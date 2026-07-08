@@ -1,10 +1,11 @@
 package com.iwhaleai.byai.framework.core.discovery;
 
+import com.iwhaleai.byai.framework.common.ClusterRedisOps;
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
+import com.iwhaleai.byai.framework.common.RedisOps;
+import com.iwhaleai.byai.framework.common.StandaloneRedisOps;
 import lombok.extern.slf4j.Slf4j;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.resps.Tuple;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -28,7 +29,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 public class DiscoveryClient {
-    private final RedisClient redisClient;
+    private final RedisOps redisOps;
     private final int cacheIntervalSeconds;
     private final Map<String, List<ServiceInstance>> cache = new ConcurrentHashMap<>();
     private final Map<String, Long> lastRefresh = new ConcurrentHashMap<>();
@@ -42,7 +43,18 @@ public class DiscoveryClient {
     }
 
     public DiscoveryClient(RedisClient redisClient, int cacheIntervalSeconds) {
-        this.redisClient = redisClient;
+        this(redisClient.getJedisCluster() != null
+                ? new ClusterRedisOps(redisClient.getJedisCluster())
+                : new StandaloneRedisOps(redisClient),
+                cacheIntervalSeconds);
+    }
+
+    public DiscoveryClient(RedisOps redisOps) {
+        this(redisOps, 5);
+    }
+
+    public DiscoveryClient(RedisOps redisOps, int cacheIntervalSeconds) {
+        this.redisOps = redisOps;
         this.cacheIntervalSeconds = cacheIntervalSeconds;
     }
 
@@ -78,42 +90,21 @@ public class DiscoveryClient {
      * 从 Redis 同步实例列表并更新缓存。
      */
     public synchronized void refreshService(String serviceName, long healthThresholdMs) {
-        try (Jedis jedis = redisClient.getResource()) {
-            // 1. 获取所有活跃 ID 及其分数（心跳时间）
-            List<Tuple> instancesWithScores = jedis.zrangeWithScores(
-                    Constants.RegistryKeys.sdActiveInstances(serviceName),
-                    0, -1
-            );
+        try {
+            // 获取所有活跃实例的详情 JSON 及心跳时间戳
+            Map<String, RedisOps.ActiveInstanceRecord> active = redisOps.fetchActiveServiceInstances(serviceName);
 
-            if (instancesWithScores == null || instancesWithScores.isEmpty()) {
+            if (active.isEmpty()) {
                 cache.put(serviceName, Collections.emptyList());
                 lastRefresh.put(serviceName, System.currentTimeMillis());
                 return;
             }
 
-            List<String> instanceIds = instancesWithScores.stream()
-                    .map(Tuple::getElement)
-                    .collect(Collectors.toList());
-
-            Map<String, Double> scoreMap = instancesWithScores.stream()
-                    .collect(Collectors.toMap(Tuple::getElement, Tuple::getScore));
-
-            // 2. 获取详情
-            List<String> detailsRaw = jedis.hmget(
-                    Constants.RegistryKeys.sdInstanceDetails(serviceName),
-                    instanceIds.toArray(new String[0])
-            );
-
             List<ServiceInstance> instances = new ArrayList<>();
-            for (String raw : detailsRaw) {
-                if (raw != null && !raw.isEmpty()) {
-                    ServiceInstance instance = ServiceInstance.fromJson(raw);
-                    Double score = scoreMap.get(instance.getId());
-                    if (score != null) {
-                        instance.setLastHeartbeat(score.longValue());
-                    }
-                    instances.add(instance);
-                }
+            for (RedisOps.ActiveInstanceRecord record : active.values()) {
+                ServiceInstance instance = ServiceInstance.fromJson(record.instanceJson());
+                instance.setLastHeartbeat(record.lastHeartbeatMs());
+                instances.add(instance);
             }
 
             cache.put(serviceName, instances);

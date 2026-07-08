@@ -8,7 +8,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.resps.Tuple;
 
 import java.util.Collections;
@@ -28,15 +27,11 @@ class DiscoveryTest {
     @Mock
     private Jedis jedis;
 
-    @Mock
-    private Pipeline pipeline;
-
     @BeforeEach
     void setUp() {
         lenient().when(redisClient.getResource()).thenReturn(jedis);
         lenient().when(redisClient.getHost()).thenReturn("127.0.0.1");
         lenient().when(redisClient.getPort()).thenReturn(6379);
-        lenient().when(jedis.pipelined()).thenReturn(pipeline);
     }
 
     @Test
@@ -56,7 +51,8 @@ class DiscoveryTest {
                 eq(instance.getId()));
 
         registry.unregister();
-        verify(jedis).pipelined();
+        verify(jedis).hdel(eq(Constants.RegistryKeys.sdInstanceDetails("test-service")), eq(instance.getId()));
+        verify(jedis).zrem(eq(Constants.RegistryKeys.sdActiveInstances("test-service")), eq(instance.getId()));
     }
 
     @Test

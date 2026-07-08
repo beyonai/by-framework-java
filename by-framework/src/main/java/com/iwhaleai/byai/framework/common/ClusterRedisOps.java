@@ -6,9 +6,11 @@ import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.params.ScanParams;
 import redis.clients.jedis.params.SetParams;
 import redis.clients.jedis.resps.ScanResult;
+import redis.clients.jedis.resps.Tuple;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -139,6 +141,46 @@ public class ClusterRedisOps implements RedisOps {
      * the node map ever includes both a master and its replica for the same
      * keyspace slice.
      */
+    @Override
+    public void registerServiceInstance(String serviceName, String instanceId, String instanceJson, long timestampMs) {
+        jedisCluster.hset(Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceId, instanceJson);
+        jedisCluster.zadd(Constants.RegistryKeys.sdActiveInstances(serviceName), timestampMs, instanceId);
+    }
+
+    @Override
+    public void heartbeatServiceInstance(String serviceName, String instanceId, long timestampMs) {
+        jedisCluster.zadd(Constants.RegistryKeys.sdActiveInstances(serviceName), timestampMs, instanceId);
+    }
+
+    @Override
+    public void unregisterServiceInstance(String serviceName, String instanceId) {
+        jedisCluster.hdel(Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceId);
+        jedisCluster.zrem(Constants.RegistryKeys.sdActiveInstances(serviceName), instanceId);
+    }
+
+    @Override
+    public Map<String, ActiveInstanceRecord> fetchActiveServiceInstances(String serviceName) {
+        List<Tuple> active = jedisCluster.zrangeWithScores(
+                Constants.RegistryKeys.sdActiveInstances(serviceName), 0, -1);
+        if (active.isEmpty()) {
+            return Map.of();
+        }
+
+        List<String> instanceIds = active.stream().map(Tuple::getElement).toList();
+        List<String> payloads = jedisCluster.hmget(
+                Constants.RegistryKeys.sdInstanceDetails(serviceName), instanceIds.toArray(new String[0]));
+
+        Map<String, ActiveInstanceRecord> result = new LinkedHashMap<>();
+        for (int i = 0; i < active.size(); i++) {
+            String payload = payloads.get(i);
+            if (payload != null && !payload.isEmpty()) {
+                result.put(instanceIds.get(i),
+                        new ActiveInstanceRecord(payload, (long) active.get(i).getScore()));
+            }
+        }
+        return result;
+    }
+
     @Override
     public List<String> scanKeys(String pattern, int limit) {
         Set<String> result = new LinkedHashSet<>();
