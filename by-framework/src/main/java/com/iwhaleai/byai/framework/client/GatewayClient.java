@@ -182,6 +182,20 @@ public class GatewayClient<T> {
         private int cancelledCount = 0;
     }
 
+    @Data
+    @Builder
+    public static class CancelSessionResponse {
+        private boolean success;
+        private String sessionId;
+        private String status;
+        private long timestamp;
+        private String error;
+        @Builder.Default
+        private int cancelledCount = 0;
+        @Builder.Default
+        private int alreadyFinishedCount = 0;
+    }
+
     /**
      * 发送异步消息给指定的 Agent 类型。
      */
@@ -493,6 +507,72 @@ public class GatewayClient<T> {
 
     public synchronized CancelTaskResponse cancelTask(String messageId, String sessionId) {
         return cancelTask(messageId, sessionId, "", "", "client", "graceful");
+    }
+
+    /**
+     * Cancel every active execution registered under a session in one call,
+     * without requiring a starting messageId the way cancelTask does.
+     */
+    public synchronized CancelSessionResponse cancelSession(
+            String sessionId,
+            String reason,
+            String targetAgentType,
+            String requestedBy,
+            String cancelMode) {
+        Map<String, Map<String, Object>> allExecutions = registry.getAllSessionExecutions(sessionId);
+
+        if (allExecutions.isEmpty()) {
+            return CancelSessionResponse.builder()
+                    .success(false)
+                    .sessionId(sessionId)
+                    .status(AgentState.NOT_FOUND)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+        }
+
+        List<Map<String, Object>> toCancel = new ArrayList<>();
+        List<Map<String, Object>> terminalExecutions = new ArrayList<>();
+        for (Map<String, Object> exec : allExecutions.values()) {
+            String status = String.valueOf(exec.getOrDefault(Constants.ExecutionFields.STATUS, ""));
+            if (Constants.TERMINAL_STATES.contains(status)) {
+                terminalExecutions.add(exec);
+            } else {
+                toCancel.add(exec);
+            }
+        }
+
+        for (Map<String, Object> terminal : terminalExecutions) {
+            String execId = String.valueOf(terminal.getOrDefault(Constants.ExecutionFields.EXECUTION_ID, ""));
+            if (!execId.isEmpty()) {
+                registry.markCancelRequested(execId, sessionId, reason != null ? reason : "");
+            }
+        }
+
+        if (toCancel.isEmpty()) {
+            return CancelSessionResponse.builder()
+                    .success(false)
+                    .sessionId(sessionId)
+                    .status("ALREADY_FINISHED")
+                    .timestamp(System.currentTimeMillis())
+                    .cancelledCount(0)
+                    .alreadyFinishedCount(terminalExecutions.size())
+                    .build();
+        }
+
+        int cancelledCount = cancelTasks(toCancel, sessionId, reason, targetAgentType, requestedBy, cancelMode);
+
+        return CancelSessionResponse.builder()
+                .success(true)
+                .sessionId(sessionId)
+                .status("CANCEL_REQUESTED")
+                .timestamp(System.currentTimeMillis())
+                .cancelledCount(cancelledCount)
+                .alreadyFinishedCount(terminalExecutions.size())
+                .build();
+    }
+
+    public synchronized CancelSessionResponse cancelSession(String sessionId, String reason) {
+        return cancelSession(sessionId, reason, "", "client", "graceful");
     }
 
     public synchronized SendResponse sendMessage(
