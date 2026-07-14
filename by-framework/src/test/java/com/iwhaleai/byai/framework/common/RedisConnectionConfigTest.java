@@ -74,6 +74,31 @@ class RedisConnectionConfigTest {
     }
 
     @Test
+    void fromEnvEmptyClusterHostIsTreatedAsUnset() {
+        System.setProperty("REDIS_CLUSTER_HOST", "");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(RedisConnectionConfig.Mode.STANDALONE, config.getMode());
+        assertTrue(config.getClusterNodes().isEmpty());
+    }
+
+    @Test
+    void fromEnvEmptyClusterHostFallsBackToClusterNodes() {
+        System.setProperty("REDIS_MODE", "cluster");
+        System.setProperty("REDIS_CLUSTER_HOST", "");
+        System.setProperty("REDIS_CLUSTER_NODES", "h1:6379,h2:6380");
+
+        RedisConnectionConfig config = RedisConnectionConfig.fromEnv();
+
+        assertEquals(RedisConnectionConfig.Mode.CLUSTER, config.getMode());
+        List<HostAndPort> nodes = config.getClusterNodes();
+        assertEquals(2, nodes.size());
+        assertEquals(new HostAndPort("h1", 6379), nodes.get(0));
+        assertEquals(new HostAndPort("h2", 6380), nodes.get(1));
+    }
+
+    @Test
     void fromEnvExplicitRedisModeOverridesClusterHost() {
         System.setProperty("REDIS_MODE", "standalone");
         System.setProperty("REDIS_CLUSTER_HOST", "h1:6379");
