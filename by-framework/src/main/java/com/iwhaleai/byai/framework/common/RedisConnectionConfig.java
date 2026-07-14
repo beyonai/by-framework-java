@@ -53,8 +53,9 @@ public class RedisConnectionConfig {
         RedisConnectionConfig config = new RedisConnectionConfig();
         String modeStr = GatewayConfig.get("REDIS_MODE");
         String clusterHost = GatewayConfig.get("REDIS_CLUSTER_HOST");
+        boolean hasClusterHost = clusterHost != null && !clusterHost.isEmpty();
         if (modeStr == null) {
-            modeStr = clusterHost != null ? "cluster" : "standalone";
+            modeStr = hasClusterHost ? "cluster" : "standalone";
         }
         config.mode = "cluster".equalsIgnoreCase(modeStr) ? Mode.CLUSTER : Mode.STANDALONE;
         config.host = GatewayConfig.get("REDIS_HOST", "localhost");
@@ -62,7 +63,7 @@ public class RedisConnectionConfig {
         config.db = GatewayConfig.getIntWithDeprecatedFallback("REDIS_DATABASE", "REDIS_DB", 0);
         config.username = GatewayConfig.get("REDIS_USERNAME");
         config.password = GatewayConfig.get("REDIS_PASSWORD");
-        String clusterNodesStr = clusterHost != null ? clusterHost : GatewayConfig.get("REDIS_CLUSTER_NODES");
+        String clusterNodesStr = hasClusterHost ? clusterHost : GatewayConfig.get("REDIS_CLUSTER_NODES");
         config.clusterNodes = parseClusterNodes(clusterNodesStr);
         return config;
     }
