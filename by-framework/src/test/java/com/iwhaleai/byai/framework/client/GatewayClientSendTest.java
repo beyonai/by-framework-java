@@ -355,6 +355,142 @@ class GatewayClientSendTest {
     }
 
     @Test
+    void sendMessageResumeReusesExistingExecutionId() throws Exception {
+        // Resuming a suspended execution must reuse its executionId and must
+        // not re-initialize the registry record for it. initializeExecution()
+        // unconditionally overwrites the messageId -> executionId mapping,
+        // which would silently detach the RESUME from the original (still
+        // WAITING_USER) execution and orphan it -- and downstream, the worker
+        // crashes trying to restore an agent config snapshot that only ever
+        // gets attached to the original execution.
+        FakeSendRegistry registry = spy(new FakeSendRegistry(redisClient, "worker-1"));
+        String regKey = Constants.RegistryKeys.sessionRegistry("sess-1");
+        Map<String, Object> existingExecution = new HashMap<>();
+        existingExecution.put("execution_id", "exec-original");
+        existingExecution.put("message_id", "msg-1");
+        existingExecution.put("session_id", "sess-1");
+        existingExecution.put("status", "WAITING_USER");
+        lenient().when(jedis.hget(regKey, Constants.RegistryFields.MSG_MAP_PREFIX + "msg-1"))
+                .thenReturn("exec-original");
+        lenient().when(jedis.hget(regKey, Constants.RegistryFields.EXEC_PREFIX + "exec-original"))
+                .thenReturn(objectMapper.writeValueAsString(existingExecution));
+
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", "SUCCESS");
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "user reply",
+                null, null, ActionType.RESUME, null, "msg-1", null, payload, null
+        );
+
+        assertTrue(response.isSuccess());
+        verify(registry, never()).initializeExecution(
+                anyString(), anyString(), anyString(), anyString(), anyString());
+        verify(registry, never()).initializeExecution(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString());
+
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(jedis).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
+        String dataJson = fieldsCaptor.getValue().get("data");
+        ResumeCommand cmd = objectMapper.readValue(dataJson, ResumeCommand.class);
+        assertEquals("msg-1", cmd.header().messageId());
+    }
+
+    @Test
+    void sendMessageResumeWithoutMatchFallsBackToInitializingNewExecution() {
+        // A RESUME whose messageId doesn't resolve to an existing execution
+        // (e.g. a genuinely new resume-shaped message) falls back to today's
+        // behavior: mint a fresh executionId and initialize it.
+        FakeSendRegistry registry = spy(new FakeSendRegistry(redisClient, "worker-1"));
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", "SUCCESS");
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "user reply",
+                null, null, ActionType.RESUME, null, "msg-unmatched", null, payload, null
+        );
+
+        assertTrue(response.isSuccess());
+        verify(registry).initializeExecution(
+                anyString(), eq("msg-unmatched"), eq("sess-1"), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void sendMessageResumeIgnoresCrossSessionExecutionRecord() throws Exception {
+        // Mirrors the sessionId cross-check cancelTask() already does after
+        // its own getExecutionByMessageId() lookup (line ~317): don't trust
+        // a returned record whose own session_id field disagrees with the
+        // session being resumed -- treat it the same as a lookup miss and
+        // fall back to minting a fresh execution.
+        FakeSendRegistry registry = spy(new FakeSendRegistry(redisClient, "worker-1"));
+        String regKey = Constants.RegistryKeys.sessionRegistry("sess-1");
+        Map<String, Object> crossSessionExecution = new HashMap<>();
+        crossSessionExecution.put("execution_id", "exec-other-session");
+        crossSessionExecution.put("message_id", "msg-1");
+        crossSessionExecution.put("session_id", "sess-other");
+        lenient().when(jedis.hget(regKey, Constants.RegistryFields.MSG_MAP_PREFIX + "msg-1"))
+                .thenReturn("exec-other-session");
+        lenient().when(jedis.hget(regKey, Constants.RegistryFields.EXEC_PREFIX + "exec-other-session"))
+                .thenReturn(objectMapper.writeValueAsString(crossSessionExecution));
+
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", "SUCCESS");
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "user reply",
+                null, null, ActionType.RESUME, null, "msg-1", null, payload, null
+        );
+
+        assertTrue(response.isSuccess());
+        verify(registry).initializeExecution(
+                anyString(), eq("msg-1"), eq("sess-1"), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void sendMessageResumeLookupFailureFallsBackGracefully() {
+        // A registry lookup failure (e.g. Redis hiccup) must not blow up the
+        // send -- mirror the defensive handling already used around
+        // initializeExecution() a few lines below in the real client.
+        FakeSendRegistry registry = spy(new FakeSendRegistry(redisClient, "worker-1"));
+        doThrow(new RuntimeException("redis down"))
+                .when(registry).getExecutionByMessageId(anyString(), anyString());
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", "SUCCESS");
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "user reply",
+                null, null, ActionType.RESUME, null, "msg-1", null, payload, null
+        );
+
+        assertTrue(response.isSuccess());
+        verify(registry).initializeExecution(
+                anyString(), eq("msg-1"), eq("sess-1"), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void sendMessageAskAgentDoesNotQueryRegistryForResumeMatch() {
+        // A fresh ASK_AGENT dispatch always gets a new messageId, so there is
+        // nothing to reattach to -- it should skip the resume lookup
+        // entirely and keep minting+initializing a new execution as before.
+        FakeSendRegistry registry = spy(new FakeSendRegistry(redisClient, "worker-1"));
+        GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());
+
+        GatewayClient.SendResponse response = client.sendMessage(
+                "demo-agent", "sess-1", "hello",
+                null, null, ActionType.ASK_AGENT, null, "msg-new", null, null, null
+        );
+
+        assertTrue(response.isSuccess());
+        verify(registry, never()).getExecutionByMessageId(anyString(), anyString());
+        verify(registry).initializeExecution(
+                anyString(), eq("msg-new"), eq("sess-1"), anyString(), anyString(), anyString());
+    }
+
+    @Test
     void sendMessageReturnsFailureWhenNoWorkerAvailable() {
         FakeSendRegistry registry = new FakeSendRegistry(redisClient, null);
         GatewayClient<String> client = new GatewayClient<>(redisClient, registry, List.of());

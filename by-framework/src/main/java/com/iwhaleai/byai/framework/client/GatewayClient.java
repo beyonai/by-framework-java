@@ -681,8 +681,29 @@ public class GatewayClient<T> {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
 
-        String executionId = Constants.EXECUTION_ID_PREFIX
-                + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+        // A RESUME reuses the messageId of the original ASK_AGENT so the worker
+        // can look the suspended execution back up. Reuse its executionId too,
+        // and skip re-initializing the registry record for it below --
+        // initializeExecution() would otherwise overwrite the
+        // messageId -> executionId mapping and detach this resume from the
+        // execution it's meant to continue.
+        Map<String, Object> resumedExecution = null;
+        if (ActionType.RESUME.equals(params.getActionType())) {
+            try {
+                Map<String, Object> found = registry.getExecutionByMessageId(messageId, params.getSessionId());
+                if (found != null
+                        && params.getSessionId().equals(found.get(Constants.ExecutionFields.SESSION_ID))) {
+                    resumedExecution = found;
+                }
+            } catch (Exception e) {
+                log.warn("Failed to look up existing execution for resume: {}", e.getMessage());
+            }
+        }
+
+        String executionId = resumedExecution != null
+                ? String.valueOf(resumedExecution.get(Constants.ExecutionFields.EXECUTION_ID))
+                : Constants.EXECUTION_ID_PREFIX
+                        + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
         String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
 
         try {
@@ -784,11 +805,16 @@ public class GatewayClient<T> {
 
             Object command = buildGatewayCommand(params, header);
 
-            try {
-                registry.initializeExecution(executionId, messageId, params.getSessionId(),
-                        selectedAgentType, params.getParentMessageId(), traceId);
-            } catch (Exception e) {
-                log.warn("Failed to initialize execution tracking: {}", e.getMessage());
+            // Skipped for a RESUME that reattached to an existing execution --
+            // that execution is already tracked, and re-initializing it here
+            // would overwrite its messageId mapping.
+            if (resumedExecution == null) {
+                try {
+                    registry.initializeExecution(executionId, messageId, params.getSessionId(),
+                            selectedAgentType, params.getParentMessageId(), traceId);
+                } catch (Exception e) {
+                    log.warn("Failed to initialize execution tracking: {}", e.getMessage());
+                }
             }
 
             // Dispatch to resolved stream
