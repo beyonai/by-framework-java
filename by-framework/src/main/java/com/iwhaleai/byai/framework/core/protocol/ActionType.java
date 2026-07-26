@@ -7,4 +7,5 @@ public class ActionType {
     public static final String SUSPEND_WORKER = "SUSPEND_WORKER";
     public static final String RESUME_WORKER = "RESUME_WORKER";
     public static final String EVICT_WORKER = "EVICT_WORKER";
+    public static final String RELOAD_PLUGINS = "RELOAD_PLUGINS";
 }

@@ -47,5 +47,6 @@ public final class GatewayCommandFactory {
         registerCommand(ActionType.SUSPEND_WORKER, SuspendWorkerCommand.class);
         registerCommand(ActionType.RESUME_WORKER, ResumeWorkerCommand.class);
         registerCommand(ActionType.EVICT_WORKER, EvictWorkerCommand.class);
+        registerCommand(ActionType.RELOAD_PLUGINS, ReloadPluginsCommand.class);
     }
 }
