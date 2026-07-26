@@ -40,6 +40,16 @@ public abstract class Plugin {
 
     public abstract List<AgentConfig> registerAgentConfigs(PluginBuildContext buildContext);
 
+    /**
+     * Transform the current stable config chain into the next version.
+     * Default is a no-op passthrough so existing plugins remain compatible; plugins that
+     * support hot reload override this to return the next full AgentConfig list for the
+     * current reload stage.
+     */
+    public List<AgentConfig> reload(PluginReloadContext context) {
+        return new ArrayList<>(context.getCurrentAgentConfigs());
+    }
+
     public void onWorkerStartup(GatewayWorker worker) {
     }
 

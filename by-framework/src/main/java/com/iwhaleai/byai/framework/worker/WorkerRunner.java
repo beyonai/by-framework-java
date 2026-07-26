@@ -5,14 +5,18 @@ import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.common.RedisStreamOps;
 import com.iwhaleai.byai.framework.common.StandaloneRedisStreamOps;
+import com.iwhaleai.byai.framework.common.XAddOptions;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
 import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
+import com.iwhaleai.byai.framework.core.extensions.PluginRegistry;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommandFactory;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ReloadPluginsCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import redis.clients.jedis.resps.StreamEntry;
@@ -53,6 +57,7 @@ public class WorkerRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean evictionHandled = new AtomicBoolean(false);
     private String lockToken;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     // Round-robin cursor for the agent_type phase-two blocking primary.
     // Only ever touched by the single agent_type loop thread.
@@ -365,6 +370,10 @@ public class WorkerRunner {
                     handleEvictWorker(streamName, entry.getID(), evictCmd);
                     return;
                 }
+                if (command instanceof ReloadPluginsCommand reloadCmd) {
+                    handleReloadPlugins(streamName, entry.getID(), reloadCmd);
+                    return;
+                }
 
                 // 2. Business Replay protection (Idempotency)
                 Map<String, Object> existing = worker.registry.getExecutionByMessageId(header.messageId(),
@@ -487,6 +496,47 @@ public class WorkerRunner {
             streamOps.xack(streamName, groupName, streamId);
         } catch (Exception e) {
             LOG.error("[{}] Error handling EvictWorkerCommand: {}", worker.workerId, e.getMessage());
+        }
+    }
+
+    private void handleReloadPlugins(String streamName, redis.clients.jedis.StreamEntryID streamId,
+            ReloadPluginsCommand command) {
+        try {
+            PluginRegistry pluginRegistry = worker.getPluginRegistry();
+            int versionBefore = pluginRegistry.getAgentConfigsVersion();
+            Map<String, Object> statusPayload = new HashMap<>();
+            statusPayload.put("reload_id", command.reloadId());
+            statusPayload.put("worker_id", worker.workerId);
+            statusPayload.put("status", "failure");
+            statusPayload.put("reason", command.reason());
+            statusPayload.put("version_before", versionBefore);
+            statusPayload.put("version_after", versionBefore);
+            statusPayload.put("error", "");
+
+            try {
+                pluginRegistry.reloadPlugins(command.reloadId(), command.reason());
+            } catch (Exception e) {
+                LOG.error("[{}] Plugin reload {} failed: {}", worker.workerId, command.reloadId(), e.getMessage());
+                if (pluginRegistry.getReloadStatus(command.reloadId()) == null) {
+                    statusPayload.put("error", e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+                }
+            }
+
+            PluginRegistry.ReloadStatus recorded = pluginRegistry.getReloadStatus(command.reloadId());
+            if (recorded != null) {
+                statusPayload.put("status", recorded.getStatus());
+                statusPayload.put("version_before", recorded.getVersionBefore());
+                statusPayload.put("version_after", recorded.getVersionAfter());
+                statusPayload.put("error", recorded.getError());
+            }
+
+            Map<String, String> fields = new HashMap<>();
+            fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(statusPayload));
+            streamOps.xadd(Constants.RegistryKeys.pluginReloadAckStream(command.reloadId()), fields, XAddOptions.noTrim());
+
+            streamOps.xack(streamName, groupName, streamId);
+        } catch (Exception e) {
+            LOG.error("[{}] Error handling ReloadPluginsCommand: {}", worker.workerId, e.getMessage());
         }
     }
 

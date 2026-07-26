@@ -3,21 +3,35 @@ package com.iwhaleai.byai.framework.core.extensions;
 import com.iwhaleai.byai.framework.worker.GatewayWorker;
 import com.iwhaleai.byai.framework.worker.AgentContext;
 import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
+import lombok.Getter;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class PluginRegistry {
+    /** Shared virtual-thread executor used to race plugin hooks against their configured timeout. */
+    private static final ExecutorService HOOK_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+
     private final List<Plugin> plugins = new ArrayList<>();
     private boolean logHookStatsOnShutdown = true;
     private final List<AgentConfig> agentConfigs = new ArrayList<>();
     private final Set<Plugin> initializedPlugins = new HashSet<>();
     private final Map<String, Map<String, HookStats>> hookStats = new HashMap<>();
+    private int agentConfigsVersion = 0;
+    private final Set<String> processedReloadIds = new HashSet<>();
+    private final Map<String, ReloadStatus> reloadStatusById = new HashMap<>();
 
     public static class HookStats {
         int success = 0;
@@ -27,8 +41,50 @@ public class PluginRegistry {
         String lastError = "";
     }
 
+    /** Immutable view of a stable AgentConfig collection version. */
+    public static class AgentConfigsSnapshot {
+        @Getter
+        private final int version;
+        @Getter
+        private final List<AgentConfig> configs;
+
+        public AgentConfigsSnapshot(int version, List<AgentConfig> configs) {
+            this.version = version;
+            this.configs = Collections.unmodifiableList(new ArrayList<>(configs));
+        }
+    }
+
+    @Getter
+    public static class ReloadStatus {
+        private final String status;
+        private final String reason;
+        private final int versionBefore;
+        private final int versionAfter;
+        private final String error;
+
+        public ReloadStatus(String status, String reason, int versionBefore, int versionAfter, String error) {
+            this.status = status;
+            this.reason = reason;
+            this.versionBefore = versionBefore;
+            this.versionAfter = versionAfter;
+            this.error = error;
+        }
+    }
+
     public List<AgentConfig> getAgentConfigs() {
         return new ArrayList<>(agentConfigs);
+    }
+
+    public int getAgentConfigsVersion() {
+        return agentConfigsVersion;
+    }
+
+    public AgentConfigsSnapshot getAgentConfigsSnapshot() {
+        return new AgentConfigsSnapshot(agentConfigsVersion, agentConfigs);
+    }
+
+    public ReloadStatus getReloadStatus(String reloadId) {
+        return reloadStatusById.get(reloadId);
     }
 
     public AgentConfig getAgentConfig(String agentId) {
@@ -84,12 +140,25 @@ public class PluginRegistry {
 
         try {
             if (timeoutSeconds != null && timeoutSeconds > 0) {
-                // TODO: Implement timeout logic with Future
-                hook.run();
+                Future<?> future = HOOK_EXECUTOR.submit(hook);
+                try {
+                    future.get(timeoutSeconds, TimeUnit.SECONDS);
+                    stat.success++;
+                } catch (TimeoutException e) {
+                    stat.timeout++;
+                    stat.lastError = "hook timeout (" + timeoutSeconds + "s)";
+                    future.cancel(true);
+                    System.err.println("Plugin " + plugin.name + " " + hookName + " timed out after " + timeoutSeconds + "s");
+                } catch (ExecutionException e) {
+                    stat.failure++;
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    stat.lastError = cause.getMessage() != null ? cause.getMessage() : "";
+                    System.err.println("Plugin " + plugin.name + " " + hookName + " failed: " + cause.getMessage());
+                }
             } else {
                 hook.run();
+                stat.success++;
             }
-            stat.success++;
         } catch (Exception e) {
             stat.failure++;
             stat.lastError = e.getMessage() != null ? e.getMessage() : "";
@@ -252,6 +321,64 @@ public class PluginRegistry {
 
     public void initializePlugins() {
         initializePlugins(null);
+    }
+
+    private static List<AgentConfig> extractReloadConfigs(List<AgentConfig> result, List<AgentConfig> fallback) {
+        return result != null ? new ArrayList<>(result) : new ArrayList<>(fallback);
+    }
+
+    private List<AgentConfig> replayReloadChain(AgentConfigsSnapshot baseSnapshot, String reloadId, String reason) {
+        List<AgentConfig> stableConfigs = baseSnapshot.getConfigs();
+        List<AgentConfig> workingConfigs = new ArrayList<>(stableConfigs);
+
+        for (Plugin plugin : getActivePlugins()) {
+            PluginReloadContext reloadContext = new PluginReloadContext(
+                    plugin.pluginId,
+                    reloadId,
+                    reason,
+                    new ArrayList<>(workingConfigs),
+                    stableConfigs,
+                    baseSnapshot.getVersion()
+            );
+            List<AgentConfig> result = plugin.reload(reloadContext);
+            workingConfigs = extractReloadConfigs(result, workingConfigs);
+            for (AgentConfig config : workingConfigs) {
+                validateAgentConfig(config);
+            }
+        }
+
+        return workingConfigs;
+    }
+
+    /**
+     * Sequentially replay plugin reload hooks over the current stable version. Each plugin
+     * receives the current working AgentConfig list and may return the next full version. The
+     * stable version is only replaced after the whole chain succeeds (ADR-0001-adjacent
+     * hot-reload invariant).
+     */
+    public AgentConfigsSnapshot reloadPlugins(String reloadId, String reason) {
+        if (processedReloadIds.contains(reloadId)) {
+            return getAgentConfigsSnapshot();
+        }
+
+        AgentConfigsSnapshot baseSnapshot = getAgentConfigsSnapshot();
+        try {
+            List<AgentConfig> nextConfigs = replayReloadChain(baseSnapshot, reloadId, reason);
+            agentConfigs.clear();
+            agentConfigs.addAll(nextConfigs);
+            agentConfigsVersion += 1;
+            AgentConfigsSnapshot nextSnapshot = getAgentConfigsSnapshot();
+            processedReloadIds.add(reloadId);
+            reloadStatusById.put(reloadId, new ReloadStatus(
+                    "success", reason, baseSnapshot.getVersion(), nextSnapshot.getVersion(), ""));
+            return nextSnapshot;
+        } catch (RuntimeException e) {
+            processedReloadIds.add(reloadId);
+            reloadStatusById.put(reloadId, new ReloadStatus(
+                    "failure", reason, baseSnapshot.getVersion(), agentConfigsVersion,
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getName()));
+            throw e;
+        }
     }
 
     public void applyDefaultHookTimeout(int timeoutSeconds) {

@@ -16,6 +16,7 @@ import com.iwhaleai.byai.framework.core.extensions.PluginRegistry;
 import com.iwhaleai.byai.framework.core.protocol.AgentState;
 import com.iwhaleai.byai.framework.core.protocol.AgentTaskResult;
 import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
+import com.iwhaleai.byai.framework.core.protocol.ContentCodec;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
 import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
@@ -23,6 +24,7 @@ import com.iwhaleai.byai.framework.core.protocol.EventType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -136,6 +138,29 @@ public abstract class GatewayWorker {
         LOG.info("[{}] Received cancel request for message: {}", workerId, command.targetMessageId());
     }
 
+    /** Content codec used to decode inbound commands before processCommand runs. Default: none. */
+    protected ContentCodec getContentCodec() {
+        return null;
+    }
+
+    /**
+     * Hook run on every inbound command before processCommand sees it. Default: identity
+     * passthrough. Subclasses (e.g. ByaiWorker) override this to decode wire content into
+     * domain objects using getContentCodec().
+     */
+    protected GatewayCommand prepareCommandForProcessing(GatewayCommand command) {
+        return command;
+    }
+
+    /**
+     * AgentContext (or subclass) constructed per message. Default: plain AgentContext.
+     * Subclasses (e.g. ByaiWorker) override this to hand processCommand a typed facade.
+     */
+    protected AgentContext createContext(String sessionId, String traceId, RedisClient redisClient,
+            String currentAgentType, String currentMessageId) {
+        return new AgentContext(sessionId, traceId, redisClient, currentAgentType, currentMessageId);
+    }
+
     public void startHeartbeat() {
         int leaseTtl = getHeartbeatLeaseTtlSeconds();
         int interval = getHeartbeatIntervalSeconds();
@@ -224,19 +249,20 @@ public abstract class GatewayWorker {
         }
     }
 
-    public void handleMessage(GatewayCommand command, String executionId) {
-        if (command instanceof CancelTaskCommand cancelCmd) {
+    public void handleMessage(GatewayCommand rawCommand, String executionId) {
+        if (rawCommand instanceof CancelTaskCommand cancelCmd) {
             onCancelTask(cancelCmd);
             return;
         }
 
+        GatewayCommand command = prepareCommandForProcessing(rawCommand);
         MessageHeader header = command.header();
         String traceId = header.traceId();
         if (traceId == null || traceId.isBlank()) {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
 
-        AgentContext context = new AgentContext(
+        AgentContext context = createContext(
                 header.sessionId(),
                 traceId,
                 redisClient,
@@ -254,7 +280,8 @@ public abstract class GatewayWorker {
             pluginRegistry.onTaskStart(context);
 
             if (isResume) {
-                if (!handleTaskGroupResume(command, header, context)) {
+                command = handleTaskGroupResume(command, header, context);
+                if (command == null) {
                     return;
                 }
             }
@@ -353,14 +380,29 @@ public abstract class GatewayWorker {
         }
     }
 
-    private boolean handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
+    /**
+     * Handles Group Join for a resumed Task Group member. Returns the command that should be
+     * passed to processCommand — for the member that completes the group, this is the ORIGINAL
+     * command with its replyData replaced by the aggregate of every member's result (ADR-0001);
+     * for a non-final member or a discarded late reply to an Aborted group, returns null to
+     * signal the caller should stop without invoking processCommand.
+     */
+    private GatewayCommand handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
         String taskGroupId = header.taskGroupId();
         if (taskGroupId != null && !taskGroupId.isBlank()) {
             String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
-            String totalStr = redisOps.hget(groupKey, "total");
+            String totalStr = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_TOTAL);
             if (totalStr != null) {
+                String aborted = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_ABORTED);
+                if (aborted != null && !aborted.isBlank()) {
+                    LOG.warn("[{}] TaskGroup {} is aborted, discarding late reply from message_id={}",
+                            workerId, taskGroupId, header.messageId());
+                    context.emitState(AgentState.CANCELLED + ": group_aborted");
+                    return null;
+                }
+
+                String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
                 if (command instanceof ResumeCommand resumeCommand) {
-                    String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
                     Map<String, Object> resultData = new HashMap<>();
                     resultData.put("status", resumeCommand.status());
                     resultData.put("reply_data", resumeCommand.replyData());
@@ -374,18 +416,41 @@ public abstract class GatewayWorker {
                     );
                     redisOps.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
                 }
-                long completed = redisOps.hincrBy(groupKey, "completed", 1);
+                long completed = redisOps.hincrBy(groupKey, Constants.TASK_GROUP_FIELD_COMPLETED, 1);
                 int total = Integer.parseInt(totalStr);
                 if (completed < total) {
                     LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
                     context.emitState(AgentState.QUEUED + ": waiting_for_group");
-                    return false;
+                    return null;
                 }
                 LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
+
+                // Group Join: resume the caller with the aggregate of every member's result,
+                // never a single arbitrary member's reply (ADR-0001).
+                Map<String, String> rawResults = redisOps.hgetAll(resultsKey);
+                List<Map<String, Object>> aggregatedResults = new ArrayList<>();
+                if (rawResults != null) {
+                    for (Map.Entry<String, String> entry : rawResults.entrySet()) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> resultData = objectMapper.readValue(entry.getValue(), Map.class);
+                        Map<String, Object> withMessageId = new HashMap<>(resultData);
+                        withMessageId.put("message_id", entry.getKey());
+                        aggregatedResults.add(withMessageId);
+                    }
+                }
+                if (command instanceof ResumeCommand resumeCommand) {
+                    command = ResumeCommand.of(
+                            resumeCommand.header(),
+                            resumeCommand.content(),
+                            resumeCommand.status(),
+                            aggregatedResults,
+                            resumeCommand.extraPayload()
+                    );
+                }
             }
         }
         context.emitState(AgentState.RESUMED);
-        return true;
+        return command;
     }
 
     private void emitFinalAnswer(AgentContext context, AgentTaskResult taskResult) {

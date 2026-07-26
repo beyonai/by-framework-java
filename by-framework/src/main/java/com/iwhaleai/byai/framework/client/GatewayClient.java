@@ -22,6 +22,7 @@ import com.iwhaleai.byai.framework.core.protocol.CancelTaskCommand;
 import com.iwhaleai.byai.framework.core.protocol.ExecutionStatus;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ReloadPluginsCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.client.interceptors.GatewayInterceptor;
 import com.iwhaleai.byai.framework.client.interceptors.SendMessageParams;
@@ -29,6 +30,9 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+
+import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.resps.StreamEntry;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -573,6 +577,87 @@ public class GatewayClient<T> {
 
     public synchronized CancelSessionResponse cancelSession(String sessionId, String reason) {
         return cancelSession(sessionId, reason, "", "client", "graceful");
+    }
+
+    /** Fan out a plugin-reload command to all online workers of an agent type. */
+    public synchronized Map<String, Object> reloadPluginsForAgentType(String agentType, String reason, String reloadId) {
+        String effectiveReloadId = (reloadId != null && !reloadId.isBlank())
+                ? reloadId
+                : "reload-" + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+        String effectiveReason = reason != null ? reason : "";
+
+        WorkerRegistry.OnlineAgentCheckResult check = registry.hasOnlineAgentType(agentType, true);
+        if (!check.exists || check.workerIds.isEmpty()) {
+            return reloadDispatchResult(effectiveReloadId, agentType, List.of());
+        }
+
+        for (String workerId : check.workerIds) {
+            ReloadPluginsCommand command = ReloadPluginsCommand.of(
+                    MessageHeader.builder()
+                            .messageId(Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH))
+                            .sessionId("reload:" + agentType)
+                            .traceId(UUID.randomUUID().toString().replace("-", ""))
+                            .targetAgentType(agentType)
+                            .build(),
+                    effectiveReloadId,
+                    effectiveReason
+            );
+            try {
+                Map<String, String> fields = new HashMap<>();
+                fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(command));
+                streamOps.xadd(Constants.QueueNames.workerCtrlStream(workerId), fields, XAddOptions.noTrim());
+            } catch (Exception e) {
+                log.error("Failed to dispatch ReloadPluginsCommand to worker {}: {}", workerId, e.getMessage());
+            }
+        }
+
+        return reloadDispatchResult(effectiveReloadId, agentType, new ArrayList<>(check.workerIds));
+    }
+
+    private static Map<String, Object> reloadDispatchResult(String reloadId, String agentType, List<String> workerIds) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("reload_id", reloadId);
+        result.put("agent_type", agentType);
+        result.put("worker_ids", workerIds);
+        result.put("dispatched_count", workerIds.size());
+        return result;
+    }
+
+    /** Read reload ACK payloads from the ACK stream for a given reload id. */
+    public synchronized List<Map<String, Object>> collectReloadAcks(String reloadId, String lastId, int blockMs, int count) {
+        String streamName = Constants.RegistryKeys.pluginReloadAckStream(reloadId);
+        StreamEntryID afterId = (lastId == null || lastId.isBlank())
+                ? new StreamEntryID("0-0")
+                : new StreamEntryID(lastId);
+
+        List<Map.Entry<String, List<StreamEntry>>> messages;
+        try {
+            messages = streamOps.xread(streamName, afterId, count, blockMs > 0 ? blockMs : null);
+        } catch (Exception e) {
+            log.error("Failed to read reload ack stream {}: {}", streamName, e.getMessage());
+            return List.of();
+        }
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        if (messages == null) {
+            return results;
+        }
+        for (Map.Entry<String, List<StreamEntry>> entry : messages) {
+            for (StreamEntry streamEntry : entry.getValue()) {
+                String raw = streamEntry.getFields().get(Constants.RedisFields.DATA);
+                if (raw == null) {
+                    continue;
+                }
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> payload = objectMapper.readValue(raw, Map.class);
+                    results.add(payload);
+                } catch (Exception e) {
+                    log.warn("Skipping invalid reload ack payload: {}", e.getMessage());
+                }
+            }
+        }
+        return results;
     }
 
     public synchronized SendResponse sendMessage(

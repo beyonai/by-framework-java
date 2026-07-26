@@ -111,6 +111,7 @@ public static final String CANCEL_MESSAGE_ID_PREFIX = "msg-cancel-";
 public static final String TASK_GROUP_FIELD_TOTAL = "total";
 public static final String TASK_GROUP_FIELD_COMPLETED = "completed";
 public static final String TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type";
+public static final String TASK_GROUP_FIELD_ABORTED = "aborted";
 
 // 时间常量
 public static final int WAIT_FOR_TASKS_TIMEOUT_SECONDS = 5;
@@ -309,6 +310,13 @@ public static final int MAX_RETRY_COUNT = 3;
             return versioned(
                     REDIS_PREFIX + "task_group:" + groupId + ":results",
                     "task_group:{" + groupId + "}:results");
+        }
+
+        /** Plugin reload ACK stream: one worker's reload outcome per entry. */
+        public static String pluginReloadAckStream(String reloadId) {
+            return versioned(
+                    REDIS_PREFIX + "plugin_reload:" + reloadId + ":ack",
+                    "plugin_reload:{" + reloadId + "}:ack");
         }
 
         // --- 服务发现 (Service Discovery) ---

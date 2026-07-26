@@ -397,8 +397,23 @@ public class AgentContext {
      * @param requests 任务列表，每个包含 agent_type, content, payload, metadata
      * @return 包含 status, task_group_id, dispatched_tasks 的映射
      */
+    public Map<String, Object> callAgents(List<Map<String, Object>> requests) {
+        return callAgents(requests, true);
+    }
+
+    /**
+     * Alias for callAgents, kept permanently for source compatibility.
+     *
+     * <p>Not deprecated: shares callAgents' implementation and behavior completely — there is
+     * no behavioral fork between the two names, only a naming one (ADR-0001).
+     */
     public Map<String, Object> dispatchGroup(List<Map<String, Object>> requests) {
-        return dispatchGroup(requests, true);
+        return callAgents(requests, true);
+    }
+
+    /** Alias for callAgents, kept permanently for source compatibility (see {@link #dispatchGroup(List)}). */
+    public Map<String, Object> dispatchGroup(List<Map<String, Object>> requests, boolean waitForReply) {
+        return callAgents(requests, waitForReply);
     }
 
     /**
@@ -408,7 +423,7 @@ public class AgentContext {
      * @param waitForReply 如果为 true，则设置 Redis 计数器等待所有任务完成
      * @return 包含 status, task_group_id, dispatched_tasks 的映射
      */
-    public Map<String, Object> dispatchGroup(List<Map<String, Object>> requests, boolean waitForReply) {
+    public Map<String, Object> callAgents(List<Map<String, Object>> requests, boolean waitForReply) {
         if (requests == null || requests.isEmpty()) {
             return Map.of("status", "EMPTY", "task_group_id", "");
         }
@@ -468,6 +483,16 @@ public class AgentContext {
                 dispatched.add(Map.of("message_id", msgId, "target_agent_type", targetAgentType));
             }
         } catch (Exception e) {
+            // A genuine dispatch-time failure partway through fan-out: mark the group Aborted
+            // so already-sent siblings' replies don't later resume this (now-failed) caller
+            // execution (ADR-0001).
+            if (waitForReply) {
+                try {
+                    redisOps.hset(Constants.RegistryKeys.taskGroup(groupId), Constants.TASK_GROUP_FIELD_ABORTED, "1");
+                } catch (Exception markException) {
+                    log.warn("Failed to mark TaskGroup {} aborted: {}", groupId, markException.getMessage());
+                }
+            }
             throw new RuntimeException("Failed to dispatch group tasks", e);
         }
 
