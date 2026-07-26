@@ -1,0 +1,61 @@
+name: Deploy Smoke Test
+
+# Validates deploy/'s Dockerfile + docker-compose.yml actually deliver a
+# message through the full pipeline - client sends -> Redis control stream
+# -> Worker consumes -> Worker replies -> Redis data stream -> client reads
+# - using examples/DemoWorker.java (built into the worker container from
+# THIS commit's source, not the last Maven Central release) and
+# examples/SendAndVerify.java (run on the host runner against the same
+# Redis, published on localhost:6379 by docker-compose).
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "by-framework/src/main/java/**"
+      - "by-framework/pom.xml"
+      - "pom.xml"
+      - ".github/workflows/deploy-smoke-test.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy/**"
+      - "by-framework/src/main/java/**"
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    env:
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build by-framework (for the SendAndVerify script below)
+        run: mvn -B -pl by-framework -am package -DskipTests
+
+      - name: Build and start Redis + Worker via deploy/docker-compose.yml
+        run: docker compose -f deploy/docker-compose.yml up --build -d --wait --wait-timeout 90
+
+      - name: Send a message and verify the Worker echoes it back
+        run: |
+          mvn -B -pl by-framework org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
+            -Dexec.mainClass=com.iwhaleai.byai.framework.examples.SendAndVerify \
+            -Dexec.classpathScope=compile
+
+      - name: Worker logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml logs worker
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v
