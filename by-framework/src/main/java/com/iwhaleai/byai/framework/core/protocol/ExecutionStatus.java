@@ -13,11 +13,18 @@ public final class ExecutionStatus {
     public static final String FAILED = "FAILED";
     public static final String SESSION_MISMATCH = "SESSION_MISMATCH";
 
-    // Error codes for error_code field
-    public static final String ERR_WORKER_NOT_ONLINE = "ERR_WORKER_NOT_ONLINE";
-    public static final String ERR_AGENT_TYPE_UNAVAILABLE = "ERR_AGENT_TYPE_UNAVAILABLE";
-    public static final String ERR_AGENT_CIRCUIT_OPEN = "ERR_AGENT_CIRCUIT_OPEN";
-    public static final String ERR_TENANT_QUOTA_EXCEEDED = "ERR_TENANT_QUOTA_EXCEEDED";
+    // Error codes for the error_code field.
+    //
+    // The ERR_ prefix belongs to the CONSTANT NAME, not to the value: these codes
+    // travel over the wire and are read by the Python and TypeScript SDKs, which
+    // both spell them unprefixed (e.g. responses.py's
+    // ERR_WORKER_NOT_ONLINE = "WORKER_NOT_ONLINE"). Java used to bake the prefix
+    // into the value too, so the same failure read differently depending on which
+    // runtime produced it.
+    public static final String ERR_WORKER_NOT_ONLINE = "WORKER_NOT_ONLINE";
+    public static final String ERR_AGENT_TYPE_UNAVAILABLE = "AGENT_TYPE_UNAVAILABLE";
+    public static final String ERR_AGENT_CIRCUIT_OPEN = "AGENT_CIRCUIT_OPEN";
+    public static final String ERR_TENANT_QUOTA_EXCEEDED = "TENANT_QUOTA_EXCEEDED";
 
     private ExecutionStatus() {
         // Prevent instantiation

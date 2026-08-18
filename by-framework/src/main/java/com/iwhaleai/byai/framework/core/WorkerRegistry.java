@@ -760,7 +760,14 @@ public class WorkerRegistry {
 
         long now = System.currentTimeMillis();
         current.put(Constants.ExecutionFields.STATUS, status);
-        current.put(Constants.ExecutionFields.FINISHED_AT, now);
+        // Only a TERMINAL status finishes an execution. WorkerRunner calls this with
+        // whatever status the task returned, which for a caller suspended on a Task Group
+        // is "QUEUED: waiting_for_group" — stamping finished_at there makes a still-running
+        // execution look completed to latency/completed-count metrics, and misreports a
+        // suspend as a finish.
+        if (AgentState.isTerminalState(status)) {
+            current.put(Constants.ExecutionFields.FINISHED_AT, now);
+        }
         current.put(Constants.ExecutionFields.UPDATED_AT, now);
 
         writeExecutionSnapshot(executionId, sessionId, current);

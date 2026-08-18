@@ -1,5 +1,6 @@
 package com.iwhaleai.byai.framework.worker;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iwhaleai.byai.framework.common.ClusterRedisOps;
 import com.iwhaleai.byai.framework.common.ClusterRedisStreamOps;
@@ -254,12 +255,21 @@ public abstract class GatewayWorker {
             pluginRegistry.onTaskStart(context);
 
             if (isResume) {
-                if (!handleTaskGroupResume(command, header, context)) {
+                // Returns null when the group is not complete (or the reply was
+                // discarded), otherwise the command to hand to processCommand —
+                // which under protocol v2 is rebuilt to carry the aggregate.
+                GatewayCommand resumed = handleTaskGroupResume(command, header, context);
+                if (resumed == null) {
                     return;
                 }
+                command = resumed;
             }
 
             Object result = processCommand(command, context);
+            // Only reached when processCommand returned normally. If it threw, callAgents
+            // has already marked the Task Group aborted and these replies must NOT be
+            // sent — the caller execution they would resume is the one that just failed.
+            flushPendingGroupReplies(context);
             AgentTaskResult taskResult = AgentTaskResult.normalize(result);
             String finalStatus = taskResult.status();
 
@@ -353,39 +363,171 @@ public abstract class GatewayWorker {
         }
     }
 
-    private boolean handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context) throws Exception {
+    private GatewayCommand handleTaskGroupResume(GatewayCommand command, MessageHeader header, AgentContext context)
+            throws Exception {
+        GatewayCommand resumed = command;
         String taskGroupId = header.taskGroupId();
         if (taskGroupId != null && !taskGroupId.isBlank()) {
             String groupKey = Constants.RegistryKeys.taskGroup(taskGroupId);
-            String totalStr = redisOps.hget(groupKey, "total");
+            String totalStr = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_TOTAL);
             if (totalStr != null) {
+                String aborted = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_ABORTED);
+                if (aborted != null && !aborted.isBlank()) {
+                    LOG.warn("[{}] TaskGroup {} is aborted, discarding late reply from sub-task message_id={}",
+                            workerId, taskGroupId, header.parentMessageId());
+                    return null;
+                }
+
+                // Which Task Group contract this group was dispatched under. No stamp
+                // means a pre-v2 dispatcher wrote it — possibly a worker still running
+                // the old code mid-upgrade — so it must keep being joined the old way.
+                String protocolVersion = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_PROTOCOL_VERSION);
+                boolean isV2 = Constants.TASK_GROUP_PROTOCOL_V2.equals(protocolVersion);
+                String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
+
                 if (command instanceof ResumeCommand resumeCommand) {
-                    String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
                     Map<String, Object> resultData = new HashMap<>();
                     resultData.put("status", resumeCommand.status());
                     resultData.put("reply_data", resumeCommand.replyData());
                     resultData.put("content", resumeCommand.content());
+                    // This reply flows FROM the sub-agent back TO the caller, so its
+                    // sourceAgentType is the agent that produced the result.
+                    resultData.put("target_agent_type", header.sourceAgentType());
                     resultData.put("metadata", resumeCommand.header().metadata());
                     resultData.put("extra_payload", resumeCommand.extraPayload());
+                    // Under v2, parentMessageId is the sub-task's own dispatch id — unique
+                    // per sibling. messageId is the caller's id, shared by every sibling,
+                    // so keying by it lets them overwrite each other.
+                    String resultField = isV2 ? header.parentMessageId() : header.messageId();
                     redisOps.hset(
                             resultsKey,
-                            header.messageId(),
+                            resultField,
                             objectMapper.writeValueAsString(resultData)
                     );
                     redisOps.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
                 }
-                long completed = redisOps.hincrBy(groupKey, "completed", 1);
+                long completed = redisOps.hincrBy(groupKey, Constants.TASK_GROUP_FIELD_COMPLETED, 1);
                 int total = Integer.parseInt(totalStr);
                 if (completed < total) {
                     LOG.info("[{}] TaskGroup {} completed {}/{}, waiting...", workerId, taskGroupId, completed, total);
                     context.emitState(AgentState.QUEUED + ": waiting_for_group");
-                    return false;
+                    return null;
                 }
                 LOG.info("[{}] TaskGroup {} ALL COMPLETED ({})!", workerId, taskGroupId, total);
+
+                if (isV2 && command instanceof ResumeCommand resumeCommand) {
+                    List<Map<String, Object>> aggregated = aggregateTaskGroup(groupKey, resultsKey, taskGroupId, total);
+                    // replyData is the single aggregation channel for a group resume;
+                    // leaving content as whichever sibling replied last would give the
+                    // caller two channels that disagree. ResumeCommand is a record, so
+                    // the aggregate is delivered by rebuilding it.
+                    resumed = ResumeCommand.of(
+                            resumeCommand.header(),
+                            "",
+                            resumeCommand.status(),
+                            aggregated,
+                            new HashMap<>(resumeCommand.extraPayload())
+                    );
+                }
             }
         }
         context.emitState(AgentState.RESUMED);
-        return true;
+        return resumed;
+    }
+
+    /**
+     * Collect a completed Task Group's results in dispatch order.
+     *
+     * <p>Order comes from the group's {@code task_order} field, not from the Redis hash,
+     * whose iteration order is unspecified — a caller fanning out to N agents needs to know
+     * which result is which without matching by hand. Results present in Redis but absent
+     * from {@code task_order} are appended rather than dropped, and a short result set is
+     * logged loudly: silently returning fewer results than were dispatched is the failure
+     * mode this SDK family rules out.
+     */
+    private List<Map<String, Object>> aggregateTaskGroup(String groupKey, String resultsKey, String taskGroupId,
+            int total) {
+        Map<String, String> rawResults = redisOps.hgetAll(resultsKey);
+        if (rawResults == null) {
+            rawResults = new HashMap<>();
+        }
+        List<String> order = new java.util.ArrayList<>();
+        String rawOrder = redisOps.hget(groupKey, Constants.TASK_GROUP_FIELD_TASK_ORDER);
+        if (rawOrder != null && !rawOrder.isBlank()) {
+            try {
+                order = objectMapper.readValue(rawOrder, new TypeReference<List<String>>() { });
+            } catch (Exception e) {
+                LOG.error("[{}] TaskGroup {} has an unreadable {} field ({}); falling back to hash order",
+                        workerId, taskGroupId, Constants.TASK_GROUP_FIELD_TASK_ORDER, rawOrder);
+            }
+        }
+
+        List<Map<String, Object>> aggregated = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String msgId : order) {
+            String data = rawResults.get(msgId);
+            if (data != null) {
+                aggregated.add(toAggregateEntry(msgId, data));
+                seen.add(msgId);
+            }
+        }
+        for (Map.Entry<String, String> entry : rawResults.entrySet()) {
+            if (!seen.contains(entry.getKey())) {
+                aggregated.add(toAggregateEntry(entry.getKey(), entry.getValue()));
+            }
+        }
+
+        if (aggregated.size() != total) {
+            List<String> missing = new java.util.ArrayList<>();
+            for (String msgId : order) {
+                if (!rawResults.containsKey(msgId)) {
+                    missing.add(msgId);
+                }
+            }
+            LOG.error("[{}] TaskGroup {} aggregated {} result(s) but expected {}; missing sub-task "
+                    + "message_ids={}. Resuming the caller with an incomplete result set.",
+                    workerId, taskGroupId, aggregated.size(), total, missing.isEmpty() ? "unknown" : missing);
+        }
+        return aggregated;
+    }
+
+    private Map<String, Object> toAggregateEntry(String messageId, String rawData) {
+        Map<String, Object> entry = new HashMap<>();
+        entry.put("message_id", messageId);
+        try {
+            Map<String, Object> data = objectMapper.readValue(rawData, new TypeReference<Map<String, Object>>() { });
+            entry.putAll(data);
+            entry.put("message_id", messageId);
+        } catch (Exception e) {
+            LOG.error("[{}] Unreadable Task Group result for sub-task {}: {}", workerId, messageId, e.getMessage());
+        }
+        return entry;
+    }
+
+    /**
+     * Deliver replies for Task Group sub-tasks that never reached a worker.
+     *
+     * <p>AgentContext.callAgents queues these instead of sending them inline: sending during
+     * the dispatch loop would put a reply on the caller's control stream strictly before the
+     * caller's processCommand returns, turning the pre-existing "a very fast sub-agent replies
+     * before the caller suspends" race from unlikely into certain.
+     *
+     * <p>Failures are logged, never thrown: a Task Group that cannot be told about a dispatch
+     * failure will time out, whereas throwing here would also destroy the caller's own result.
+     */
+    private void flushPendingGroupReplies(AgentContext context) {
+        List<ResumeCommand> pending = context.drainPendingGroupReplies();
+        for (ResumeCommand reply : pending) {
+            try {
+                Map<String, String> fields = new HashMap<>();
+                fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(reply));
+                streamOps.xadd(Constants.QueueNames.ctrlStream(reply.header().targetAgentType()),
+                        fields, XAddOptions.noTrim());
+            } catch (Exception e) {
+                LOG.error("[{}] Failed to deliver Task Group {} dispatch-failure reply for sub-task {}: {}",
+                        workerId, reply.header().taskGroupId(), reply.header().parentMessageId(), e.getMessage());
+            }
+        }
     }
 
     private void emitFinalAnswer(AgentContext context, AgentTaskResult taskResult) {
@@ -426,9 +568,20 @@ public abstract class GatewayWorker {
         Map<String, Object> mergedMetadata = new HashMap<>(header.metadata());
         mergedMetadata.putAll(taskResult.metadata());
 
+        // messageId MUST be the caller's own message id (this dispatch's
+        // parentMessageId). WorkerRunner reattaches the suspended caller execution
+        // via getExecutionByMessageId(header.messageId()); a fresh id there makes
+        // that lookup miss every time, so the reply mints a new execution and
+        // orphans the one it was meant to continue. parentMessageId stays this
+        // sub-task's own id — the only value unique per sibling, which is what
+        // Group Join keys the result hash by under protocol v2.
+        String callbackMessageId = header.parentMessageId() != null && !header.parentMessageId().isEmpty()
+                ? header.parentMessageId()
+                : "msg-" + UUID.randomUUID().toString().substring(0, 8);
+
         ResumeCommand callbackMsg = ResumeCommand.of(
                 MessageHeader.builder()
-                        .messageId("msg-" + UUID.randomUUID().toString().substring(0, 8))
+                        .messageId(callbackMessageId)
                         .sessionId(header.sessionId())
                         .traceId(header.traceId())
                         .sourceAgentType(header.targetAgentType() != null ? header.targetAgentType() : workerId)

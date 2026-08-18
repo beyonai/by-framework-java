@@ -228,7 +228,9 @@ class AvailabilityRouterTest {
  
         assertEquals(AvailabilityStatus.REJECT, result.getStatus());
         assertTrue(result.getReason().contains("Circuit breaker open"));
-        assertEquals("ERR_AGENT_CIRCUIT_OPEN", result.getErrorCode());
+        // The ERR_ prefix belongs to the constant name, not the wire value: Python and
+        // TS spell these unprefixed and read the same field.
+        assertEquals("AGENT_CIRCUIT_OPEN", result.getErrorCode());
     }
 
     @Test
@@ -242,7 +244,7 @@ class AvailabilityRouterTest {
  
         assertEquals(AvailabilityStatus.REJECT, result.getStatus());
         assertTrue(result.getReason().contains("Quota exceeded"));
-        assertEquals("ERR_TENANT_QUOTA_EXCEEDED", result.getErrorCode());
+        assertEquals("TENANT_QUOTA_EXCEEDED", result.getErrorCode());
     }
 
     @Test

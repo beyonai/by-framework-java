@@ -11,6 +11,7 @@ import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommandFactory;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import org.slf4j.Logger;
@@ -369,9 +370,23 @@ public class WorkerRunner {
                 // 2. Business Replay protection (Idempotency)
                 Map<String, Object> existing = worker.registry.getExecutionByMessageId(header.messageId(),
                         header.sessionId());
+                if (command instanceof ResumeCommand && existing == null) {
+                    // Not fatal, but it means this resume is starting a NEW, disconnected
+                    // execution instead of continuing the suspended one it was meant to
+                    // resume. Silently doing so is how orphaned executions hide.
+                    LOG.warn("[{}] ResumeCommand did not resolve to an existing execution "
+                            + "(message_id={}, session_id={}); starting a new, disconnected execution "
+                            + "instead of continuing the suspended one.",
+                            worker.workerId, header.messageId(), header.sessionId());
+                }
                 if (existing != null) {
                     String status = String.valueOf(existing.get(Constants.ExecutionFields.STATUS));
-                    if (Constants.TERMINAL_STATES.contains(status)) {
+                    // Skip terminal-state replays — but never for a ResumeCommand. A resume
+                    // is the CONTINUATION of the execution it resolves to, not a replay of
+                    // it, so acking it away here would silently drop a real reply. Dormant
+                    // until agent returns started carrying the caller's messageId; without
+                    // this exception that fix turns an orphaned execution into a lost reply.
+                    if (Constants.TERMINAL_STATES.contains(status) && !(command instanceof ResumeCommand)) {
                         LOG.info("[{}] Skipping terminal replay: {} -> {}", worker.workerId, header.messageId(),
                                 status);
                         streamOps.xack(streamName, groupName, entry.getID());

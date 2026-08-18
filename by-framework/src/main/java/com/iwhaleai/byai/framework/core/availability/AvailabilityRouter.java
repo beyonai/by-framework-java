@@ -528,8 +528,10 @@ public class AvailabilityRouter {
      * Adapter to avoid circular dependency on ExecutionStatus constants.
      */
     private static final class ExecutionStatusAdapter {
-        static final String ERR_AGENT_TYPE_UNAVAILABLE = "ERR_AGENT_TYPE_UNAVAILABLE";
-        static final String ERR_AGENT_CIRCUIT_OPEN = "ERR_AGENT_CIRCUIT_OPEN";
-        static final String ERR_TENANT_QUOTA_EXCEEDED = "ERR_TENANT_QUOTA_EXCEEDED";
+        // Values must stay identical to ExecutionStatus's — the ERR_ prefix is part
+        // of the constant name only, never of the wire value (see ExecutionStatus).
+        static final String ERR_AGENT_TYPE_UNAVAILABLE = "AGENT_TYPE_UNAVAILABLE";
+        static final String ERR_AGENT_CIRCUIT_OPEN = "AGENT_CIRCUIT_OPEN";
+        static final String ERR_TENANT_QUOTA_EXCEEDED = "TENANT_QUOTA_EXCEEDED";
     }
 }

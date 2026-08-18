@@ -21,6 +21,8 @@ import com.iwhaleai.byai.framework.core.protocol.AskAgentCommand;
 import com.iwhaleai.byai.framework.core.protocol.DataMessage;
 import com.iwhaleai.byai.framework.core.protocol.EventType;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ExecutionStatus;
+import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
 import lombok.extern.slf4j.Slf4j;
 
@@ -43,6 +45,14 @@ public class AgentContext {
     private final WorkerRegistry workerRegistry;
     private final AvailabilityRouter availabilityRouter;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    /**
+     * Task Group sub-tasks that never reached a worker (their target agent type was
+     * unavailable at dispatch time). Each is a fully-formed ResumeCommand addressed back at
+     * this caller, so Group Join counts and aggregates it exactly like a real sub-agent's
+     * failure reply. GatewayWorker flushes these AFTER processCommand returns — see
+     * {@link #drainPendingGroupReplies()}.
+     */
+    private final List<ResumeCommand> pendingGroupReplies = new java.util.ArrayList<>();
 
     // SSE Content Types
     private static final String CONTENT_TYPE_TEXT = "1002";
@@ -297,8 +307,25 @@ public class AgentContext {
     public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
             Map<String, Object> metadata, String taskGroupId, String routePolicy, long availabilityTimeoutMs,
             String region, String priority) {
+        return dispatchSingleTask(targetAgentType, content, payload, waitForReply, metadata, taskGroupId,
+                routePolicy, availabilityTimeoutMs, region, priority, null);
+    }
 
-        String msgId = Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
+    /**
+     * Build, availability-check and dispatch one AskAgentCommand.
+     *
+     * <p>Shared by {@link #callAgent} (a single task) and {@link #callAgents} (a batch, one
+     * call per task), so a task in a group behaves exactly like the equivalent single call.
+     * The only extra parameter is {@code messageId}: a batch needs to assign each sub-task a
+     * known id, because Task Group results are keyed per sub-task.
+     */
+    private Map<String, Object> dispatchSingleTask(String targetAgentType, Object content, Map<String, Object> payload,
+            boolean waitForReply, Map<String, Object> metadata, String taskGroupId, String routePolicy,
+            long availabilityTimeoutMs, String region, String priority, String messageId) {
+
+        String msgId = messageId != null && !messageId.isBlank()
+                ? messageId
+                : Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
         String executionId = Constants.EXECUTION_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
         String resolvedPolicy = routePolicy != null ? routePolicy : RoutePolicy.FAIL_FAST;
 
@@ -326,6 +353,9 @@ public class AgentContext {
             Map<String, Object> errorResponse = new HashMap<>();
             errorResponse.put(Constants.RedisFields.STATUS, AgentState.FAILED);
             errorResponse.put("message_id", "");
+            // The resolved caller message id: callAgents needs it to address the synthetic
+            // failure reply back at the caller's own suspended execution.
+            errorResponse.put("parent_message_id", currentMessageId);
             errorResponse.put("target_agent_type", targetAgentType);
             errorResponse.put("error", availResult.getReason());
             errorResponse.put("error_code", availResult.getErrorCode() != null ? availResult.getErrorCode() : "ERR_AGENT_TYPE_UNAVAILABLE");
@@ -409,83 +439,188 @@ public class AgentContext {
      * @return 包含 status, task_group_id, dispatched_tasks 的映射
      */
     public Map<String, Object> dispatchGroup(List<Map<String, Object>> requests, boolean waitForReply) {
+        return callAgents(requests, waitForReply);
+    }
+
+    /**
+     * Dispatch multiple tasks concurrently as a Task Group — callAgent's plural.
+     *
+     * <p>Every per-call option {@link #callAgent} takes is accepted per task, with the same
+     * defaults, so a task that names no routing options behaves exactly like the equivalent
+     * single call. The only increment is that the caller is resumed once, with every task's
+     * result aggregated in dispatch order, after all of them complete. On that resume
+     * {@code replyData} is the aggregate and {@code content} is {@code ""}.
+     *
+     * <p>Task map keys: {@code agent_type} (required), {@code content}, {@code payload},
+     * {@code metadata}, {@code message_id}, {@code route_policy},
+     * {@code availability_timeout_ms}, {@code region}, {@code priority}.
+     *
+     * <p>Contract: by-framework-python/docs/adr/0001-unify-call-agent-and-call-agents-behavior.md
+     */
+    public Map<String, Object> callAgents(List<Map<String, Object>> requests) {
+        return callAgents(requests, true);
+    }
+
+    /** See {@link #callAgents(List)}. */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> callAgents(List<Map<String, Object>> requests, boolean waitForReply) {
         if (requests == null || requests.isEmpty()) {
-            return Map.of("status", "EMPTY", "task_group_id", "");
+            throw new IllegalArgumentException("callAgents/dispatchGroup requires at least one task");
         }
 
-        String groupId = Constants.TASK_GROUP_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+        String groupId = Constants.TASK_GROUP_ID_PREFIX
+                + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
         int total = requests.size();
-        List<Map<String, String>> dispatched = new java.util.ArrayList<>();
+        List<Map<String, Object>> dispatched = new java.util.ArrayList<>();
+        List<ResumeCommand> pendingFailures = new java.util.ArrayList<>();
+        String groupKey = Constants.RegistryKeys.taskGroup(groupId);
 
-        try {
-            String key = Constants.RegistryKeys.taskGroup(groupId);
+        if (waitForReply) {
             Map<String, String> groupData = new HashMap<>();
             groupData.put(Constants.TASK_GROUP_FIELD_TOTAL, String.valueOf(total));
             groupData.put(Constants.TASK_GROUP_FIELD_COMPLETED, "0");
             groupData.put(Constants.TASK_GROUP_FIELD_SOURCE_AGENT, currentAgentType);
-            redisOps.hsetAll(key, groupData);
-            redisOps.expire(key, Constants.TASK_GROUP_TTL_SECONDS);
+            groupData.put(Constants.TASK_GROUP_FIELD_PROTOCOL_VERSION, Constants.TASK_GROUP_PROTOCOL_V2);
+            redisOps.hsetAll(groupKey, groupData);
+            redisOps.expire(groupKey, Constants.TASK_GROUP_TTL_SECONDS);
+        }
 
-            for (Map<String, Object> req : requests) {
-                String targetAgentType = (String) req.get(Constants.DispatchFields.AGENT_TYPE);
-                String content = (String) req.getOrDefault(Constants.DispatchFields.CONTENT, "");
-                Map<String, Object> payload = (Map<String, Object>) req.getOrDefault(Constants.DispatchFields.PAYLOAD, new HashMap<>());
-                Map<String, Object> metadata = (Map<String, Object>) req.getOrDefault(Constants.DispatchFields.METADATA, new HashMap<>());
+        for (Map<String, Object> req : requests) {
+            String targetAgentType = (String) req.get(Constants.DispatchFields.AGENT_TYPE);
+            Object content = req.getOrDefault(Constants.DispatchFields.CONTENT, "");
+            Map<String, Object> payload = (Map<String, Object>) req.getOrDefault(
+                    Constants.DispatchFields.PAYLOAD, new HashMap<String, Object>());
+            Map<String, Object> metadata = (Map<String, Object>) req.getOrDefault(
+                    Constants.DispatchFields.METADATA, new HashMap<String, Object>());
+            String taskMessageId = (String) req.get("message_id");
+            String routePolicy = (String) req.getOrDefault("route_policy", RoutePolicy.FAIL_FAST);
+            long availabilityTimeoutMs = req.get("availability_timeout_ms") instanceof Number n
+                    ? n.longValue() : 0L;
+            String region = (String) req.get("region");
+            String priority = (String) req.get("priority");
 
+            Map<String, Object> taskResult;
+            try {
+                taskResult = dispatchSingleTask(targetAgentType, content, payload, waitForReply, metadata,
+                        groupId, routePolicy, availabilityTimeoutMs, region, priority, taskMessageId);
+            } catch (RuntimeException e) {
+                // A genuine dispatch-time failure (not an availability rejection, which
+                // dispatchSingleTask turns into a FAILED result instead of throwing). Stop
+                // fanning out and mark the group aborted so already-sent siblings' replies
+                // cannot later resume this now-failed caller execution. Synthetic replies
+                // queued so far are dropped with the throw: the worker only flushes them
+                // once processCommand returns normally.
                 if (waitForReply) {
-                    payload = new HashMap<>(payload);
-                    payload.put("wait_for_reply", true);
+                    redisOps.hset(groupKey, Constants.TASK_GROUP_FIELD_ABORTED, "1");
                 }
-
-                String msgId = Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
-                String execId = Constants.EXECUTION_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
-                AskAgentCommand command = AskAgentCommand.of(
-                        MessageHeader.builder()
-                                .messageId(msgId)
-                                .sessionId(sessionId)
-                                .traceId(traceId)
-                                .sourceAgentType(waitForReply ? currentAgentType : "")
-                                .targetAgentType(targetAgentType)
-                                .parentMessageId(currentMessageId)
-                                .taskGroupId(groupId)
-                                .metadata(metadata)
-                                .build(),
-                        content,
-                        waitForReply,
-                        payload);
-
-                Map<String, String> fields = new HashMap<>();
-                fields.put(Constants.RedisFields.DATA, objectMapper.writeValueAsString(command));
-                streamOps.xadd(Constants.QueueNames.ctrlStream(targetAgentType), fields, XAddOptions.noTrim());
-
-                // Initialize execution tracking for each dispatched task
-                try {
-                    workerRegistry.initializeExecution(execId, msgId, sessionId, targetAgentType, currentMessageId);
-                } catch (Exception ex) {
-                    log.warn("Failed to initialize execution tracking for group dispatch: {}", ex.getMessage());
-                }
-
-                dispatched.add(Map.of("message_id", msgId, "target_agent_type", targetAgentType));
+                throw e;
             }
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to dispatch group tasks", e);
+
+            String status = String.valueOf(taskResult.get(Constants.RedisFields.STATUS));
+            String dispatchedMessageId = String.valueOf(taskResult.getOrDefault("message_id", ""));
+            if (dispatchedMessageId.isEmpty()) {
+                dispatchedMessageId = taskMessageId != null ? taskMessageId
+                        : Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
+            }
+            String resolvedTarget = String.valueOf(taskResult.getOrDefault("target_agent_type", targetAgentType));
+
+            if (AgentState.FAILED.equals(status) && waitForReply) {
+                // The target agent type was unavailable, so no worker will ever reply for
+                // this sub-task. Rather than book-keeping the group here — a second copy of
+                // the accounting GatewayWorker's Group Join owns, and the one that could push
+                // `completed` to `total` with nobody left to resume the caller — synthesize
+                // the reply a sub-agent WOULD have sent had it started and failed.
+                pendingFailures.add(buildGroupFailureReply(groupId, dispatchedMessageId, resolvedTarget,
+                        taskResult.get("error"), taskResult.get("error_code"), metadata));
+            }
+
+            Map<String, Object> dispatchedEntry = new HashMap<>();
+            dispatchedEntry.put("message_id", dispatchedMessageId);
+            // taskResult's target_agent_type reflects any fallback reroute the availability
+            // router performed, so this stays consistent with what Group Join later reports.
+            dispatchedEntry.put("target_agent_type", resolvedTarget);
+            dispatchedEntry.put("status", status);
+            if (AgentState.FAILED.equals(status)) {
+                // Same shape a real sub-agent failure arrives in, so callers read
+                // dispatch-time and run-time failures the same way.
+                Map<String, Object> failure = new HashMap<>();
+                failure.put("error", taskResult.get("error"));
+                failure.put("error_code", taskResult.get("error_code"));
+                dispatchedEntry.put("reply_data", failure);
+            }
+            dispatched.add(dispatchedEntry);
+        }
+
+        if (waitForReply) {
+            // Written after the loop so it records exactly what was dispatched. Group Join
+            // aggregates in this order and uses it to name results that never arrived.
+            List<String> order = new java.util.ArrayList<>();
+            for (Map<String, Object> entry : dispatched) {
+                order.add(String.valueOf(entry.get("message_id")));
+            }
+            try {
+                redisOps.hset(groupKey, Constants.TASK_GROUP_FIELD_TASK_ORDER,
+                        objectMapper.writeValueAsString(order));
+            } catch (JsonProcessingException e) {
+                log.error("Failed to record task_order for group {}: {}", groupId, e.getMessage());
+            }
+            pendingGroupReplies.addAll(pendingFailures);
         }
 
         Map<String, Object> result = new HashMap<>();
-        result.put("status", "GROUP_QUEUED");
+        result.put("status", AgentState.QUEUED);
         result.put("task_group_id", groupId);
         result.put("dispatched_tasks", dispatched);
         return result;
     }
 
     /**
-     * 收集任务组所有子任务的结果。
-     * 当最后一个子任务完成后调用，返回所有子任务的结果列表。
+     * Build the reply a sub-agent WOULD have sent had it started and failed.
      *
-     * @param taskGroupId dispatchGroup 返回的 task_group_id
-     * @param timeoutSeconds 等待所有结果的最大超时时间（秒），默认 30.0
-     * @return 包含所有子任务结果的列表，每个元素包含 message_id, status, reply_data, content
+     * <p>The header derivation mirrors GatewayWorker's agent return exactly, because that
+     * shape is load-bearing in two places: {@code messageId} must be the CALLER's own message
+     * id (WorkerRunner reattaches the suspended execution via
+     * {@code getExecutionByMessageId(header.messageId())}), and {@code parentMessageId} must
+     * be this sub-task's dispatch id (the only per-sibling-unique value, which is what Group
+     * Join keys the result hash by).
+     *
+     * <p>{@code replyData} carries the failure detail because that is how a real failure
+     * arrives; putting it anywhere else would make dispatch-time and run-time failures read
+     * differently.
      */
+    private ResumeCommand buildGroupFailureReply(String taskGroupId, String taskMessageId, String targetAgentType,
+            Object error, Object errorCode, Map<String, Object> metadata) {
+        Map<String, Object> replyData = new HashMap<>();
+        replyData.put("error", error);
+        replyData.put("error_code", errorCode != null ? errorCode : ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE);
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId(currentMessageId)
+                        .sessionId(sessionId)
+                        .traceId(traceId)
+                        .sourceAgentType(targetAgentType)
+                        .targetAgentType(currentAgentType)
+                        .parentMessageId(taskMessageId)
+                        .taskGroupId(taskGroupId)
+                        .metadata(metadata != null ? new HashMap<>(metadata) : new HashMap<>())
+                        .build(),
+                "",
+                AgentState.FAILED,
+                replyData,
+                new HashMap<>());
+    }
+
+    /**
+     * Hand the worker any dispatch-failure replies queued by {@link #callAgents} and clear
+     * them. Called after processCommand returns — never inline during dispatch, which would
+     * guarantee a reply reaches the caller's control stream before the caller suspends.
+     */
+    public List<ResumeCommand> drainPendingGroupReplies() {
+        List<ResumeCommand> drained = new java.util.ArrayList<>(pendingGroupReplies);
+        pendingGroupReplies.clear();
+        return drained;
+    }
+
     public List<Map<String, Object>> collectGroupResults(String taskGroupId) {
         return collectGroupResults(taskGroupId, 30.0);
     }
