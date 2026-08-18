@@ -108,9 +108,26 @@ public static final String TASK_GROUP_ID_PREFIX = "tg-";
 public static final String CANCEL_MESSAGE_ID_PREFIX = "msg-cancel-";
 
 // 任务组 Hash 字段
+// 这些字段名是跨运行时的线上契约：Python 与 TS SDK 读写同一个 hash。
+// 完整契约见 by-framework-python/docs/adr/0001-unify-call-agent-and-call-agents-behavior.md
 public static final String TASK_GROUP_FIELD_TOTAL = "total";
 public static final String TASK_GROUP_FIELD_COMPLETED = "completed";
 public static final String TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type";
+/** 批量派发中途失败时置位；此后到达的回包一律丢弃，不再唤醒已终止的调用方。 */
+public static final String TASK_GROUP_FIELD_ABORTED = "aborted";
+/**
+ * 任务组协议版本，由派发方写入。缺失表示该组由 v2 之前的派发方创建 —— Group Join
+ * 必须回落到旧行为（结果以回包自身 messageId 为键、不做聚合），否则滚动升级会用错误的
+ * 契约重新解释进行中的任务组。
+ */
+public static final String TASK_GROUP_FIELD_PROTOCOL_VERSION = "protocol_version";
+/**
+ * 组内子任务派发 messageId 的 JSON 数组，按派发顺序排列。Group Join 依此顺序聚合，
+ * 并据此指出哪些结果始终未到达，而不是静默返回一个短列表。
+ */
+public static final String TASK_GROUP_FIELD_TASK_ORDER = "task_order";
+/** 版本 2：结果按子任务键存储、按序聚合进调用方 replyData、组恢复时清空 content。 */
+public static final String TASK_GROUP_PROTOCOL_V2 = "2";
 
 // 时间常量
 public static final int WAIT_FOR_TASKS_TIMEOUT_SECONDS = 5;

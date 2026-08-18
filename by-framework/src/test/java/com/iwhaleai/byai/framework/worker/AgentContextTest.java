@@ -124,7 +124,8 @@ class AgentContextTest {
 
         assertEquals("FAILED", result.get("status"));
         assertNotNull(result.get("error_code"));
-        assertTrue(result.get("error_code").toString().contains("ERR_AGENT_TYPE_UNAVAILABLE"));
+        // Unprefixed on the wire, matching Python and TS.
+        assertEquals("AGENT_TYPE_UNAVAILABLE", result.get("error_code"));
         verify(jedis, never()).xadd(anyString(), any(XAddParams.class), anyMap());
     }
 
@@ -146,22 +147,87 @@ class AgentContextTest {
 
     @Test
     void dispatchGroupCreatesGroupInRedisAndDispatchesSubTasks() throws Exception {
+        // Batch tasks now go through the same availability check a single callAgent
+        // does, so the targets have to be online for anything to be dispatched.
+        when(jedis.smembers(anyString())).thenReturn(java.util.Set.of("worker-1"));
+        when(jedis.get(Constants.RegistryKeys.workerOnlineLease("worker-1"))).thenReturn("1");
+
         List<Map<String, Object>> requests = List.of(
                 Map.of("agent_type", "a1", "content", "c1"),
                 Map.of("agent_type", "a2", "content", "c2"));
 
-        context.dispatchGroup(requests);
+        Map<String, Object> result = context.dispatchGroup(requests);
 
-        // 1. Group info in Redis (hset with Map overload)
+        // 1. Group info in Redis (hset with Map overload), now carrying the protocol stamp
         ArgumentCaptor<Map<String, String>> hsetCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis).hset(anyString(), hsetCaptor.capture());
         Map<String, String> groupData = hsetCaptor.getValue();
         assertEquals("2", groupData.get("total"));
         assertEquals("0", groupData.get("completed"));
+        assertEquals(Constants.TASK_GROUP_PROTOCOL_V2,
+                groupData.get(Constants.TASK_GROUP_FIELD_PROTOCOL_VERSION));
         verify(jedis).expire(anyString(), eq(86400L));
 
         // 2. Commands sent via jedis.xadd (not pipeline)
         verify(jedis, times(2)).xadd(anyString(), any(XAddParams.class), anyMap());
+
+        // 3. Matches Python/TS: QUEUED, and every dispatched task reports its status.
+        assertEquals("QUEUED", result.get("status"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> dispatched = (List<Map<String, Object>>) result.get("dispatched_tasks");
+        assertEquals(2, dispatched.size());
+        assertEquals("QUEUED", dispatched.get(0).get("status"));
+
+        // 4. task_order is written after the loop, in dispatch order.
+        ArgumentCaptor<String> orderCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jedis).hset(anyString(), eq(Constants.TASK_GROUP_FIELD_TASK_ORDER), orderCaptor.capture());
+        List<String> order = objectMapper.readValue(orderCaptor.getValue(), List.class);
+        assertEquals(List.of(dispatched.get(0).get("message_id"), dispatched.get(1).get("message_id")), order);
+    }
+
+    @Test
+    void callAgentsRejectsAnEmptyTaskList() {
+        assertThrows(IllegalArgumentException.class, () -> context.callAgents(List.of()));
+    }
+
+    @Test
+    void callAgentsQueuesASyntheticReplyForAnUnavailableTarget() {
+        // No online worker for the target: the task fails its availability check.
+        when(jedis.smembers(anyString())).thenReturn(java.util.Collections.emptySet());
+
+        Map<String, Object> result = context.callAgents(
+                List.of(Map.of("agent_type", "offline-agent", "content", "c1")));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> dispatched = (List<Map<String, Object>>) result.get("dispatched_tasks");
+        assertEquals("FAILED", dispatched.get(0).get("status"));
+
+        // Nothing was dispatched, and the dispatcher did NOT book-keep the group:
+        // storing the result and counting completion belong to Group Join, and a second
+        // copy here is what could push `completed` to `total` with no reply left to
+        // resume the caller.
+        verify(jedis, never()).hincrBy(anyString(), eq(Constants.TASK_GROUP_FIELD_COMPLETED), anyLong());
+
+        // Instead the reply a sub-agent would have sent is queued for the worker to flush.
+        List<com.iwhaleai.byai.framework.core.protocol.ResumeCommand> pending =
+                context.drainPendingGroupReplies();
+        assertEquals(1, pending.size());
+        var reply = pending.get(0);
+        assertEquals("FAILED", reply.status());
+        assertEquals("", reply.content());
+        // Addressed back at the caller: messageId is what WorkerRunner reattaches the
+        // suspended execution by, parentMessageId is the sub-task's own id that Group
+        // Join keys the result hash by.
+        assertEquals("msg-1", reply.header().messageId());
+        assertEquals(dispatched.get(0).get("message_id"), reply.header().parentMessageId());
+        assertEquals("offline-agent", reply.header().sourceAgentType());
+        assertEquals("test-agent", reply.header().targetAgentType());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> replyData = (Map<String, Object>) reply.replyData();
+        assertEquals("AGENT_TYPE_UNAVAILABLE", replyData.get("error_code"));
+
+        // Drained exactly once.
+        assertTrue(context.drainPendingGroupReplies().isEmpty());
     }
 
     @Test

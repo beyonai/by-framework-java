@@ -390,4 +390,25 @@ class WorkerRegistryTest {
         // Then
         assertTrue(result.isEmpty());
     }
+
+    @Test
+    void markExecutionFinishedDoesNotStampFinishedAtForNonTerminalStatus() {
+        // WorkerRunner calls this with whatever status the task returned. A caller
+        // suspended on a Task Group returns "QUEUED: waiting_for_group" — that is a
+        // suspend, not a finish, and stamping finished_at would make a still-running
+        // execution look completed to latency/completed-count metrics.
+        String regKey = Constants.RegistryKeys.sessionRegistry("sess-1");
+        String existingJson = "{\"execution_id\":\"exec-1\",\"status\":\"RUNNING\"}";
+        when(jedis.hget(regKey, "exec:exec-1")).thenReturn(existingJson);
+
+        registry.markExecutionFinished("exec-1", "sess-1", "QUEUED: waiting_for_group");
+
+        ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+        verify(jedis).hset(eq(regKey), eq("exec:exec-1"), captor.capture());
+
+        String updatedJson = captor.getValue();
+        assertTrue(updatedJson.contains("\"status\":\"QUEUED: waiting_for_group\""));
+        assertFalse(updatedJson.contains("\"finished_at\""));
+        assertTrue(updatedJson.contains("\"updated_at\""));
+    }
 }
