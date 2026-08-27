@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Groundwork for bounding a suspended caller. A caller that dispatches with
+  `waitForReply` ends its execution and is revived by a `ResumeCommand`, so
+  nothing inside it can time it out; `callAgent` and `askUser` now register the
+  wait in a sharded index that a sweep will later read. Nothing reads it yet, so
+  there is no behaviour change. `callAgent` gains an optional `replyTimeoutMs`.
+- A suspended caller is persisted as `WAITING_AGENT` / `WAITING_USER` rather
+  than whatever the handler returned while unwinding. Visible on the execution
+  record and in the dashboard; `QUEUED` now means only "not yet picked up".
+
 ### Fixed
+- Task Group results were keyed by the caller's message id, so every sibling in
+  a group wrote the same field and overwrote each other — the join then read one
+  member's result repeated N times. They are now keyed by the sub-task's own
+  message id, matching the Python and TypeScript SDKs.
+- A single `callAgent` result is stored before the reply is sent, so a lost
+  reply message no longer loses the answer with it.
 - A resumed execution now replies to its real caller. Previously
   `hasSourceAgent` was gated on `!isResume`, so an `A -> B -> C` chain dropped
   B's result and a sub-agent that called `askUser` and then finished never
