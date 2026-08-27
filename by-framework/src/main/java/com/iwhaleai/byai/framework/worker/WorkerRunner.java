@@ -163,7 +163,7 @@ public class WorkerRunner {
         // stop the worker from consuming. The sweep is a safety net, not a
         // dependency of the happy path.
         try {
-            waitSweeper = new WaitSweeper(redisOps, worker.workerId);
+            waitSweeper = new WaitSweeper(redisOps, streamOps, worker.registry, worker.workerId);
             waitSweeper.start();
         } catch (Exception e) {
             LOG.warn("[{}] WaitSweeper failed to start: {}", worker.workerId, e.getMessage());

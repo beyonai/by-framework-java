@@ -11,7 +11,10 @@ import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 import redis.clients.jedis.params.SetParams;
 
+import java.util.List;
 import java.util.Map;
+
+import com.iwhaleai.byai.framework.core.protocol.AgentState;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -24,11 +27,19 @@ class WaitSweeperTest {
     @Mock
     private RedisOps redisOps;
 
+    @Mock
+    private com.iwhaleai.byai.framework.common.RedisStreamOps streamOps;
+
+    @Mock
+    private com.iwhaleai.byai.framework.core.WorkerRegistry registry;
+
     private WaitSweeper sweeper(boolean compensate, boolean prune) {
-        return new WaitSweeper(redisOps, "worker-1", compensate, prune,
+        return new WaitSweeper(redisOps, streamOps, registry, "worker-1", compensate, prune,
                 Constants.WAIT_SWEEP_INTERVAL_SECONDS,
                 Constants.WAIT_PRUNE_INTERVAL_SECONDS,
-                Constants.WAIT_SWEEP_LOCK_TTL_SECONDS);
+                Constants.WAIT_SWEEP_LOCK_TTL_SECONDS,
+                Constants.WAIT_RENEW_MAX_MULTIPLE,
+                true);
     }
 
     // --- the two switches are independent (contract section 9) --------------
@@ -177,5 +188,214 @@ class WaitSweeperTest {
         verify(redisOps, atLeastOnce()).zremRangeByScore(second.capture(), anyDouble(), anyDouble());
 
         assertNotEquals(firstShardOfPassOne, second.getAllValues().get(0));
+    }
+
+    // --- compensation triage ------------------------------------------------
+
+    private static final String SESSION = "sess-1";
+    private static final String CALLER_MSG = "msg-caller";
+    private static final String CHILD_MSG = "msg-child";
+
+    private String member(String childMessageId, String groupId) {
+        return WaitIndex.encodeMember(SESSION, CALLER_MSG, childMessageId, groupId);
+    }
+
+    /** Arms one due entry in shard N with the given member. */
+    private WaitSweeper armedSweeper(String member) {
+        int shard = WaitIndex.shardForSession(SESSION);
+        when(redisOps.set(anyString(), anyString(), any(SetParams.class))).thenReturn("OK");
+        when(redisOps.zrangeByScore(eq(Constants.RegistryKeys.waitIndex(shard)),
+                anyDouble(), anyDouble(), anyInt())).thenReturn(List.of(member));
+        when(redisOps.zscore(anyString(), anyString()))
+                .thenReturn((double) (System.currentTimeMillis() - 1000));
+        return sweeper(true, false);
+    }
+
+    private static Map<String, Object> execution(String status, String workerId) {
+        Map<String, Object> m = new java.util.HashMap<>();
+        m.put("status", status);
+        m.put("worker_id", workerId);
+        m.put("execution_id", "exec-x");
+        m.put("target_agent_type", "agent-child");
+        m.put("source_agent_type", "agent-caller");
+        m.put("created_at", System.currentTimeMillis() - 60_000);
+        return m;
+    }
+
+    @Test
+    void aMalformedMemberIsDroppedRatherThanRetriedForever() {
+        WaitSweeper s = armedSweeper("not|enough|fields");
+
+        Map<String, Integer> outcomes = s.sweepOnce();
+
+        assertEquals(1, outcomes.get(WaitSweeper.OUTCOME_MALFORMED));
+        verify(redisOps).zrem(anyString(), eq("not|enough|fields"));
+    }
+
+    @Test
+    void anEntryWhoseCallerHasNoRecordIsDropped() {
+        // The session registry expired: no reply, synthesised or real, can
+        // reattach this caller any more.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION))).thenReturn(null);
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_CALLER_MISSING));
+        verify(redisOps).zrem(anyString(), eq(member(CHILD_MSG, "")));
+    }
+
+    @Test
+    void anAlreadyTerminalCallerIsNeverWokenAgain() {
+        // Waking a finished execution is exactly what the idempotency work
+        // exists to prevent — clean up, synthesise nothing.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.COMPLETED, "worker-a"));
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_CALLER_TERMINAL));
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void anAskUserWaitIsSkippedRatherThanCompensated() {
+        // "The human hasn't answered yet" is not a fault and has no
+        // compensation; the entry stays so a repeated answer is still
+        // recognised as a duplicate by the gate.
+        WaitSweeper s = armedSweeper(member("", ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_USER, "worker-a"));
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_ASK_USER_SKIPPED));
+        verify(redisOps, never()).zrem(anyString(), anyString());
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void aCalleeThatIsItselfWaitingIsRenewedNotFailed() {
+        // Its own entry has a deadline of its own and will fail first if that
+        // wait breaks. Killing this one now would collapse the whole chain at
+        // once and report the wrong cause at every level.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-b"));
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_CHILD_WAITING));
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+        // Renewed, not removed.
+        verify(redisOps).zadd(anyString(), anyDouble(), eq(member(CHILD_MSG, "")));
+    }
+
+    @Test
+    void aCalleeWhoseWorkerIsGoneGetsASynthesisedFailure() {
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.RUNNING, "worker-dead"));
+        when(registry.isWorkerOnline("worker-dead")).thenReturn(false);
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_WORKER_LOST));
+        verify(streamOps).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void aCalleeOnALiveWorkerBuysMoreTimeUpToTheCeiling() {
+        // Running long is not the same as being dead, and the lease is the only
+        // signal that tells them apart.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.RUNNING, "worker-live"));
+        when(registry.isWorkerOnline("worker-live")).thenReturn(true);
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_CHILD_ALIVE));
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void theSweeperNeverWritesGroupAccountingItself() {
+        // Writing the result and the counter here would be a second
+        // implementation of the group's accounting, and when THAT copy is the
+        // increment reaching total there is no reply left to trigger the join.
+        // The synthesised reply carries the group id so the existing join does it.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, "tg-1"));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.RUNNING, "worker-dead"));
+        when(registry.isWorkerOnline("worker-dead")).thenReturn(false);
+        when(redisOps.hget(anyString(), eq(Constants.TASK_GROUP_FIELD_TOTAL))).thenReturn("2");
+
+        s.sweepOnce();
+
+        verify(redisOps, never()).hincrBy(anyString(), eq("completed"), anyLong());
+        verify(streamOps).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void aGroupMemberAlreadyJoinedByItsReplyIsDropped() {
+        // A result under this sub-task's id can only have been written by the
+        // join, so its reply already arrived and was counted. A second
+        // synthesised reply would be counted a second time.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, "tg-1"));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(redisOps.hget(anyString(), eq(Constants.TASK_GROUP_FIELD_TOTAL))).thenReturn("2");
+        when(redisOps.hget(anyString(), eq(CHILD_MSG))).thenReturn("{\"status\":\"COMPLETED\"}");
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_GROUP_ALREADY_JOINED));
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void aVanishedTaskGroupIsCleanedUpNotCompensated() {
+        // A reply would find no group to join, so it would resume the caller
+        // with one sibling's payload where the aggregate belongs.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, "tg-1"));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(redisOps.hget(anyString(), eq(Constants.TASK_GROUP_FIELD_TOTAL))).thenReturn(null);
+
+        assertEquals(1, s.sweepOnce().get(WaitSweeper.OUTCOME_GROUP_GONE));
+        verify(streamOps, never()).xadd(anyString(), anyMap(), any());
+    }
+
+    @Test
+    void theWaitEntryIsRenewedRatherThanRemovedAfterSynthesising() {
+        // Removing it would leave the synthesised reply as the only copy that
+        // must not be gated — and a reply that bypasses the gate is a second
+        // wake-up path, which is what makes double-resumes possible at all.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.RUNNING, "worker-dead"));
+        when(registry.isWorkerOnline("worker-dead")).thenReturn(false);
+
+        s.sweepOnce();
+
+        verify(redisOps).zadd(anyString(), anyDouble(), eq(member(CHILD_MSG, "")));
+        verify(redisOps, never()).zrem(anyString(), eq(member(CHILD_MSG, "")));
+    }
+
+    @Test
+    void theFirstRenewalRecordsTheOriginalDeadlineWithNx() {
+        // Overwriting the score destroys the only record of the original
+        // deadline; without saving it, the ceiling would re-measure from the
+        // deadline it just pushed out and could never be reached.
+        WaitSweeper s = armedSweeper(member(CHILD_MSG, ""));
+        when(registry.getExecutionByMessageId(eq(CALLER_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-a"));
+        when(registry.getExecutionByMessageId(eq(CHILD_MSG), eq(SESSION)))
+                .thenReturn(execution(AgentState.WAITING_AGENT, "worker-b"));
+
+        s.sweepOnce();
+
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        verify(redisOps, atLeastOnce()).set(keys.capture(), anyString(), any(SetParams.class));
+        assertTrue(keys.getAllValues().stream().anyMatch(k -> k.contains("wait_renew_origin")),
+                "the first renewal must save the original deadline");
     }
 }

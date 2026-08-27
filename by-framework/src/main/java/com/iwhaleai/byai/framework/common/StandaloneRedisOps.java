@@ -258,6 +258,13 @@ public class StandaloneRedisOps implements RedisOps {
     }
 
     @Override
+    public Double zscore(String key, String member) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.zscore(key, member);
+        }
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         List<String> result = new ArrayList<>();
         ScanParams params = new ScanParams().match(pattern).count(100);
