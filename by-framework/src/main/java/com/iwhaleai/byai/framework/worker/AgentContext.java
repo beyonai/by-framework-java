@@ -77,6 +77,22 @@ public class AgentContext {
         return suspendedState;
     }
 
+    /**
+     * Stand-in replies dispatchGroup queued for members it could not dispatch.
+     *
+     * <p>They are NOT sent inline. Sending inline puts a reply on the caller's own
+     * control stream strictly BEFORE the caller's handler returns and its
+     * execution is recorded as suspended — which turns the pre-existing "a very
+     * fast sub-agent replies first" race from unlikely into certain. Flushing
+     * after the handler returns leaves that race exactly as bad as it already is
+     * for real sub-agents, and no worse.
+     */
+    private final List<com.iwhaleai.byai.framework.core.protocol.ResumeCommand> pendingGroupReplies = new java.util.ArrayList<>();
+
+    List<com.iwhaleai.byai.framework.core.protocol.ResumeCommand> pendingGroupReplies() {
+        return pendingGroupReplies;
+    }
+
     /** Package-private: the framework sets this, and same-package tests drive it. */
     void markSuspended(String state) {
         this.suspended = true;
@@ -535,6 +551,25 @@ public class AgentContext {
 
                 String msgId = Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
                 String execId = Constants.EXECUTION_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
+
+                // A member whose target has no online worker is not dispatched.
+                // Blind-dispatching means that member never replies and the group
+                // never completes — the caller hangs until a sweep notices, and
+                // the sweep's compensation half is off by default.
+                //
+                // Queue a stand-in FAILED reply instead, so the group's EXISTING
+                // join accounting sees exactly one result per member. Note what
+                // this deliberately does NOT do: write the result or HINCRBY
+                // `completed` here. That would be a second accounting
+                // implementation, and when its increment is the one that fills the
+                // group there is no reply left to trigger the join — the exact
+                // defect Python and TS each had to fix.
+                if (waitForReply && !probeMemberOnline(targetAgentType)) {
+                    pendingGroupReplies.add(standInFailure(groupId, msgId, targetAgentType));
+                    dispatched.add(Map.of("message_id", msgId, "target_agent_type", targetAgentType));
+                    continue;
+                }
+
                 AskAgentCommand command = AskAgentCommand.of(
                         MessageHeader.builder()
                                 .messageId(msgId)
@@ -591,6 +626,53 @@ public class AgentContext {
      * @param timeoutSeconds 等待所有结果的最大超时时间（秒），默认 30.0
      * @return 包含所有子任务结果的列表，每个元素包含 message_id, status, reply_data, content
      */
+    /**
+     * Whether a group member's target agent type has an online worker.
+     *
+     * <p>Deliberately the bare online check rather than the full
+     * AvailabilityRouter: Python's dispatch_group does not pass a route policy
+     * either, so it takes the FAIL_FAST default and the two stay equivalent. If
+     * any SDK later wires route policy into group dispatch they diverge, and both
+     * must move together.
+     *
+     * <p>Fail-soft towards dispatching: if the probe itself errors we dispatch
+     * anyway, because a wrongly-skipped member is a guaranteed missing reply
+     * whereas a wrongly-dispatched one still has the wait index behind it.
+     */
+    private boolean probeMemberOnline(String targetAgentType) {
+        try {
+            return workerRegistry.hasOnlineAgentType(targetAgentType, true).exists;
+        } catch (Exception e) {
+            log.warn("Availability probe failed for '{}', dispatching anyway: {}",
+                    targetAgentType, e.getMessage());
+            return true;
+        }
+    }
+
+    /** The reply an unavailable member would have sent, had it been dispatched. */
+    private com.iwhaleai.byai.framework.core.protocol.ResumeCommand standInFailure(
+            String groupId, String childMessageId, String targetAgentType) {
+        Map<String, Object> replyData = new HashMap<>();
+        replyData.put("error", "Agent type unavailable: " + targetAgentType);
+        replyData.put("error_code", Constants.LivenessErrorCode.CHILD_NEVER_STARTED);
+        replyData.put("child_message_id", childMessageId);
+
+        return com.iwhaleai.byai.framework.core.protocol.ResumeCommand.of(
+                MessageHeader.builder()
+                        // Addressed to the caller and keyed by the caller's own id
+                        // so it can reattach; parentMessageId names the member,
+                        // which is what the join keys results by.
+                        .messageId(currentMessageId)
+                        .sessionId(sessionId)
+                        .traceId(traceId)
+                        .sourceAgentType(targetAgentType)
+                        .targetAgentType(currentAgentType)
+                        .parentMessageId(childMessageId)
+                        .taskGroupId(groupId)
+                        .build(),
+                "", AgentState.FAILED, replyData, new HashMap<>());
+    }
+
     public List<Map<String, Object>> collectGroupResults(String taskGroupId) {
         return collectGroupResults(taskGroupId, 30.0);
     }

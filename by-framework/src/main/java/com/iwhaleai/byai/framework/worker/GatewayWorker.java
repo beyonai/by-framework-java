@@ -294,6 +294,15 @@ public abstract class GatewayWorker {
             // was originally dispatched with, merged under the waking message's
             // own metadata.
             Object result = processCommand(inboundCommand, context);
+            // Flush dispatchGroup's stand-ins only now, after the handler returned
+            // normally. Sending them inline during dispatch would put a reply on
+            // the caller's own control stream strictly BEFORE its execution is
+            // recorded as suspended, turning the "a very fast sub-agent replies
+            // first" race from unlikely into certain.
+            //
+            // And only on the normal path: if the handler threw, the caller
+            // execution these would resume is the one that just failed.
+            flushPendingGroupReplies(context);
             AgentTaskResult taskResult = AgentTaskResult.normalize(result);
             String finalStatus = taskResult.status();
 
@@ -642,6 +651,35 @@ public abstract class GatewayWorker {
         } catch (Exception e) {
             LOG.warn("[{}] Failed to persist single-call result for message_id={}: {}",
                     workerId, childMessageId, e.getMessage());
+        }
+    }
+
+    /**
+     * Send the stand-ins dispatchGroup queued, once the caller is done.
+     *
+     * <p>Fail-soft per reply: a stand-in that cannot be delivered costs this group
+     * its dispatch-time failure notice — which the wait index and its sweep can
+     * still compensate — whereas throwing here would also destroy the caller's own
+     * result.
+     */
+    private void flushPendingGroupReplies(AgentContext context) {
+        List<ResumeCommand> pending = context.pendingGroupReplies();
+        if (pending.isEmpty()) {
+            return;
+        }
+        List<ResumeCommand> replies = new java.util.ArrayList<>(pending);
+        pending.clear();
+        for (ResumeCommand reply : replies) {
+            try {
+                Map<String, String> fields = new HashMap<>();
+                fields.put("data", objectMapper.writeValueAsString(reply));
+                streamOps.xadd(
+                        Constants.QueueNames.ctrlStream(reply.header().targetAgentType()),
+                        fields, XAddOptions.noTrim());
+            } catch (Exception e) {
+                LOG.warn("[{}] Failed to flush a stand-in group reply for {}: {}",
+                        workerId, reply.header().parentMessageId(), e.getMessage());
+            }
         }
     }
 

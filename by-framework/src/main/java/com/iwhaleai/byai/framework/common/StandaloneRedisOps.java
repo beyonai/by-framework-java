@@ -237,6 +237,13 @@ public class StandaloneRedisOps implements RedisOps {
     }
 
     @Override
+    public boolean exists(String key) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.exists(key);
+        }
+    }
+
+    @Override
     public List<String> zrangeByScore(String key, double min, double max, int limit) {
         try (Jedis jedis = redisClient.getResource()) {
             return new ArrayList<>(jedis.zrangeByScore(key, min, max, 0, limit));

@@ -28,6 +28,9 @@ public interface RedisOps {
 
     void setex(String key, int seconds, String value);
 
+    /** Whether a key exists. */
+    boolean exists(String key);
+
     long del(String key);
 
     long expire(String key, int seconds);

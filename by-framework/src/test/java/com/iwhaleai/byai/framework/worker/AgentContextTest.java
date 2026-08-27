@@ -146,6 +146,14 @@ class AgentContextTest {
 
     @Test
     void dispatchGroupCreatesGroupInRedisAndDispatchesSubTasks() throws Exception {
+        // Both targets have an online worker, so both are dispatched for real.
+        // Without this the availability probe correctly skips them and queues
+        // stand-in failures instead — see the test below.
+        lenient().when(jedis.smembers(anyString())).thenReturn(java.util.Set.of("worker-x"));
+        // isWorkerOnline reads the lease with GET, not EXISTS.
+        lenient().when(jedis.get(startsWith("byai_gateway:registry:worker:online:")))
+                .thenReturn("1");
+
         List<Map<String, Object>> requests = List.of(
                 Map.of("agent_type", "a1", "content", "c1"),
                 Map.of("agent_type", "a2", "content", "c2"));
@@ -225,5 +233,67 @@ class AgentContextTest {
         assertEquals("my-trace", ctx.getTraceId());
         assertEquals("my-agent", ctx.getCurrentAgentType());
         assertEquals("my-msg", ctx.getCurrentMessageId());
+    }
+
+    // ---- E5: group dispatch compensation ----------------------------------
+
+    @Test
+    void anUnavailableGroupMemberIsNotDispatchedAndIsQueuedInstead() {
+        // No online workers for either target. Blind-dispatching would mean those
+        // members never reply and the group never completes, hanging the caller
+        // until a sweep notices — and the sweep's compensation half is off by
+        // default.
+        lenient().when(jedis.smembers(anyString())).thenReturn(java.util.Set.of());
+
+        context.dispatchGroup(List.of(
+                Map.of("agent_type", "offline-1", "content", "c1"),
+                Map.of("agent_type", "offline-2", "content", "c2")));
+
+        // Nothing dispatched...
+        verify(jedis, never()).xadd(anyString(), any(XAddParams.class), anyMap());
+        // ...but a stand-in queued per member, so the join still sees one result each.
+        assertEquals(2, context.pendingGroupReplies().size());
+    }
+
+    @Test
+    void standInsAreQueuedNotSentInline() {
+        // Sending inline would put a reply on the caller's own control stream
+        // strictly BEFORE its execution is recorded as suspended, turning the
+        // "a very fast sub-agent replies first" race from unlikely into certain.
+        // They go out only after the handler returns (see GatewayWorker).
+        lenient().when(jedis.smembers(anyString())).thenReturn(java.util.Set.of());
+
+        context.dispatchGroup(List.of(Map.of("agent_type", "offline-1", "content", "c1")));
+
+        verify(jedis, never()).xadd(anyString(), any(XAddParams.class), anyMap());
+        assertFalse(context.pendingGroupReplies().isEmpty());
+    }
+
+    @Test
+    void theStandInIsAddressedToTheCallerAndNamesTheMember() {
+        lenient().when(jedis.smembers(anyString())).thenReturn(java.util.Set.of());
+
+        context.dispatchGroup(List.of(Map.of("agent_type", "offline-1", "content", "c1")));
+
+        var reply = context.pendingGroupReplies().get(0);
+        // Keyed by the caller's own id so it can reattach its execution...
+        assertEquals(context.getCurrentMessageId(), reply.header().messageId());
+        // ...while parentMessageId names the member, which is what the join keys by.
+        assertFalse(reply.header().parentMessageId().isBlank());
+        assertEquals(com.iwhaleai.byai.framework.core.protocol.AgentState.FAILED, reply.status());
+        assertFalse(reply.header().taskGroupId().isBlank());
+    }
+
+    @Test
+    void theDispatcherNeverAccountsForTheGroupItself() {
+        // Writing the result or HINCRBYing `completed` here would be a second
+        // accounting implementation, and when its increment is the one that fills
+        // the group there is no reply left to trigger the join. Python and TS each
+        // had to fix exactly that; Java must not introduce it while adding the probe.
+        lenient().when(jedis.smembers(anyString())).thenReturn(java.util.Set.of());
+
+        context.dispatchGroup(List.of(Map.of("agent_type", "offline-1", "content", "c1")));
+
+        verify(jedis, never()).hincrBy(anyString(), eq("completed"), anyLong());
     }
 }

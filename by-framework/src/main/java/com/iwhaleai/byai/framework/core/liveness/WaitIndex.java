@@ -36,6 +36,29 @@ public final class WaitIndex {
     }
 
     /**
+     * Stable short id for a member, for keys that are named after one.
+     *
+     * <p>The member is hashed rather than embedded because it is built from
+     * caller-controlled ids of unbounded length. SHA-1 hex for the same reason as
+     * FNV-1a: trivially reproducible across SDKs, and every key derived from it is
+     * cross-SDK contract surface.
+     */
+    public static String memberDigest(String member) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+            byte[] hash = md.digest((member == null ? "" : member).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-1 unavailable", e);
+        }
+    }
+
+    /**
      * FNV-1a 32-bit over UTF-8.
      *
      * <p><b>Deliberately not {@code String.hashCode()}</b>, which is a different

@@ -197,6 +197,11 @@ public class ClusterRedisOps implements RedisOps {
     }
 
     @Override
+    public boolean exists(String key) {
+        return jedisCluster.exists(key);
+    }
+
+    @Override
     public List<String> zrangeByScore(String key, double min, double max, int limit) {
         return new ArrayList<>(jedisCluster.zrangeByScore(key, min, max, 0, limit));
     }
