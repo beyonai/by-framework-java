@@ -796,4 +796,38 @@ class GatewayWorkerTest {
         assertEquals("acme", restored.header().metadata().get("tenant"));
         assertNotSame(raw, restored);
     }
+
+    // ---- E1: result storage -----------------------------------------------
+
+    @Test
+    void groupResultsAreKeyedBySubTaskSoSiblingsDoNotOverwrite() {
+        // A reply's header.messageId is the CALLER's id — the direction reverses
+        // on the way back — so keying results by it makes every sibling in a
+        // group write the same field. The group then joins on one member's
+        // result repeated N times. Python and TS both key by the sub-task's own
+        // dispatch-time id, which is header.parentMessageId here.
+        EchoWorker worker = new EchoWorker("worker-1", redisClient);
+        when(jedis.hget(anyString(), eq("total"))).thenReturn("2");
+        when(jedis.hincrBy(anyString(), eq("completed"), eq(1L))).thenReturn(1L);
+
+        ResumeCommand memberReply = ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-caller")        // the caller's id
+                        .sessionId("sess-1").traceId("t-1")
+                        .sourceAgentType("agent-child")
+                        .targetAgentType("echo-agent")
+                        .parentMessageId("msg-child-1")  // THIS sibling's own id
+                        .taskGroupId("tg-1")
+                        .build(),
+                "done", AgentState.COMPLETED, Map.of("n", 1), Map.of());
+
+        worker.handleMessage(memberReply, "exec-1", null, true);
+
+        ArgumentCaptor<String> field = ArgumentCaptor.forClass(String.class);
+        verify(jedis, atLeastOnce()).hset(anyString(), field.capture(), anyString());
+        assertTrue(field.getAllValues().contains("msg-child-1"),
+                "group results must be keyed by the sub-task's own message id");
+        assertFalse(field.getAllValues().contains("msg-caller"),
+                "keying by the caller's id makes siblings overwrite each other");
+    }
 }

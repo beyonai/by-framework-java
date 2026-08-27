@@ -407,15 +407,17 @@ public abstract class GatewayWorker {
             if (totalStr != null) {
                 if (command instanceof ResumeCommand resumeCommand) {
                     String resultsKey = Constants.RegistryKeys.taskGroupResults(taskGroupId);
-                    Map<String, Object> resultData = new HashMap<>();
-                    resultData.put("status", resumeCommand.status());
-                    resultData.put("reply_data", resumeCommand.replyData());
-                    resultData.put("content", resumeCommand.content());
-                    resultData.put("metadata", resumeCommand.header().metadata());
-                    resultData.put("extra_payload", resumeCommand.extraPayload());
+                    Map<String, Object> resultData = buildResultData(resumeCommand);
+                    // Keyed by the SUB-TASK's own message id, not by header.messageId().
+                    // A reply's header.messageId is the CALLER's id (the direction is
+                    // reversed on the way back), so keying by it makes every sibling in
+                    // a group write the same field and overwrite each other — the group
+                    // then joins on one member's result repeated N times.
+                    // header.parentMessageId is the sub-task's dispatch-time id, which
+                    // is what Python and TS both key by.
                     redisOps.hset(
                             resultsKey,
-                            header.messageId(),
+                            header.parentMessageId(),
                             objectMapper.writeValueAsString(resultData)
                     );
                     redisOps.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
@@ -578,6 +580,58 @@ public abstract class GatewayWorker {
                 new HashMap<>(resume.extraPayload()));
     }
 
+    /**
+     * The stored shape of one sub-task's result.
+     *
+     * <p>Kept isomorphic with what the single-call path persists, because the
+     * same readers consume both — a recovery that can tell the two apart is a
+     * recovery with two code paths.
+     */
+    private Map<String, Object> buildResultData(ResumeCommand reply) {
+        Map<String, Object> resultData = new HashMap<>();
+        resultData.put("status", reply.status());
+        resultData.put("reply_data", reply.replyData());
+        resultData.put("content", reply.content());
+        // The sub-agent that produced this result: on a reply that is the
+        // header's sourceAgentType, since the direction reverses on the way back.
+        resultData.put("target_agent_type", reply.header().sourceAgentType());
+        resultData.put("metadata", reply.header().metadata());
+        resultData.put("extra_payload", reply.extraPayload());
+        return resultData;
+    }
+
+    /**
+     * Persist a single (non-group) call_agent result before replying.
+     *
+     * <p>A lost reply message used to lose the answer with it. A Task Group
+     * already keeps full results; a single call reuses that exact storage as a
+     * group of one (see TASK_GROUP_SINGLE_ID_PREFIX), which keeps recovery on one
+     * code path. The reply message then carries nothing that is not recoverable
+     * from Redis.
+     *
+     * <p>Fail-soft: losing the copy only costs recoverability, so an error here
+     * must never stop the reply from going out.
+     */
+    private void persistSingleCallResult(MessageHeader dispatchHeader, ResumeCommand reply) {
+        if (dispatchHeader.taskGroupId() != null && !dispatchHeader.taskGroupId().isBlank()) {
+            return; // A real Task Group: the join path already stores it.
+        }
+        String childMessageId = dispatchHeader.messageId();
+        if (childMessageId == null || childMessageId.isBlank()) {
+            return;
+        }
+        try {
+            String resultsKey = Constants.RegistryKeys.taskGroupResults(
+                    Constants.TASK_GROUP_SINGLE_ID_PREFIX + childMessageId);
+            redisOps.hset(resultsKey, childMessageId,
+                    objectMapper.writeValueAsString(buildResultData(reply)));
+            redisOps.expire(resultsKey, Constants.TASK_GROUP_TTL_SECONDS);
+        } catch (Exception e) {
+            LOG.warn("[{}] Failed to persist single-call result for message_id={}: {}",
+                    workerId, childMessageId, e.getMessage());
+        }
+    }
+
     private void enqueueAgentReturn(GatewayCommand command, String status, Object replyData) {
         enqueueAgentReturn(command, new AgentTaskResult(status, "", replyData, Map.of(), Map.of()));
     }
@@ -614,6 +668,12 @@ public abstract class GatewayWorker {
                 taskResult.replyData(),
                 new HashMap<>(taskResult.extraPayload())
         );
+
+        // Store the answer BEFORE sending it. If the reply message is lost in
+        // transit, a sweep can still recover the result from Redis rather than
+        // synthesising a fabricated failure for a sub-task that actually
+        // succeeded.
+        persistSingleCallResult(header, callbackMsg);
 
         try {
             Map<String, String> fields = new HashMap<>();
