@@ -146,6 +146,33 @@ public class MyAssistant extends GatewayWorker {
 }
 ```
 
+### `header.metadata` across a suspend
+
+An agent that suspends — `askUser`, or `callAgent` with `waitForReply` — ends its
+execution and is revived later by a `ResumeCommand`. Metadata is restored in two
+directions, and the rules are deliberately different:
+
+- **What your handler reads** (`command.header().metadata()` on the resumed
+  call): the metadata this execution was **originally dispatched with**, merged
+  under the waking message's own metadata. Same-named keys go to the waking
+  message, since it is the newer, more specific hop. Without the restore,
+  everything you were dispatched with would vanish the first time you suspended.
+- **What your caller receives**: the metadata **it** dispatched you with, as a
+  full replacement, plus anything you return in `metadata` layered on top. The
+  message that woke you is plumbing for that one hop and never reaches your
+  caller, even though you can see it yourself.
+
+Three framework-injected keys — `trace_parent_span_id`,
+`framework_parent_span_id`, `langfuse_parent_observation_id` — always describe
+the current hop and are never restored from the record.
+
+A suspended execution does **not** reply to its caller yet: the value your
+handler returns merely to unwind is not a result, and sending it would wake the
+caller early and burn the single reply it is parked on. The real result goes out
+when the execution resumes and finishes. The exception is a terminal status — a
+handler that reached COMPLETED/FAILED/CANCELLED after dispatching is finished and
+will never be resumed, so it replies immediately.
+
 ---
 
 ## 📡 Sending Tasks

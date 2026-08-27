@@ -598,6 +598,26 @@ public class WorkerRegistry {
      */
     public synchronized void initializeExecution(String executionId, String messageId, String sessionId,
                                                   String targetAgentType, String parentMessageId, String traceId) {
+        initializeExecution(executionId, messageId, sessionId, targetAgentType, parentMessageId, traceId, null);
+    }
+
+    /**
+     * Initialize a new execution, with the resume-path fields a caller can supply.
+     *
+     * <p>{@code extraFields} carries what the positional overloads cannot:
+     * {@code source_agent_type} (who to reply to, and the client sentinel for a
+     * root dispatch), {@code task_group_id}, and {@code metadata} (what this
+     * execution was dispatched with). A resumed execution reads all three back
+     * off its own record — the ResumeCommand that wakes it describes the hop that
+     * just finished, not the dispatch being answered.
+     *
+     * <p>New fields go here rather than onto the positional signature: this class
+     * already carries two positional overloads, and a third would be unreadable
+     * at the call site.
+     */
+    public synchronized void initializeExecution(String executionId, String messageId, String sessionId,
+                                                  String targetAgentType, String parentMessageId, String traceId,
+                                                  Map<String, Object> extraFields) {
         long now = System.currentTimeMillis();
         Map<String, Object> execution = new HashMap<>();
         execution.put(Constants.ExecutionFields.EXECUTION_ID, executionId);
@@ -610,6 +630,10 @@ public class WorkerRegistry {
         execution.put(Constants.ExecutionFields.UPDATED_AT, now);
         if (parentMessageId != null && !parentMessageId.isEmpty()) {
             execution.put("parent_message_id", parentMessageId);
+        }
+
+        if (extraFields != null) {
+            execution.putAll(extraFields);
         }
 
         List<Map<String, Object>> timeline = new ArrayList<>();

@@ -177,7 +177,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        Thread taskThread = new Thread(() -> worker.handleMessage(command, "exec-1"));
+        Thread taskThread = new Thread(() -> worker.handleMessage(command, "exec-1", null, false));
         taskThread.start();
 
         // Give it a moment to start
@@ -214,7 +214,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCommand);
         assertInstanceOf(AskAgentCommand.class, worker.lastCommand);
@@ -244,7 +244,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastContext);
         assertEquals("sess-1", worker.lastContext.getSessionId());
@@ -268,7 +268,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastContext);
         assertNotNull(worker.lastContext.getTraceId());
@@ -291,7 +291,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCommand);
         assertInstanceOf(ResumeCommand.class, worker.lastCommand);
@@ -314,7 +314,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
@@ -339,7 +339,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
@@ -365,7 +365,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Should enqueue callback to caller-agent's ctrl stream
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
@@ -395,7 +395,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
@@ -443,7 +443,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
@@ -469,7 +469,7 @@ class GatewayWorkerTest {
                         .build())
                 .build();
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCancelCommand);
         assertEquals("target-msg-1", worker.lastCancelCommand.targetMessageId());
@@ -489,7 +489,7 @@ class GatewayWorkerTest {
                         .build())
                 .build();
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // processCommand should not be called for cancel commands
         assertNull(worker.lastCommand);
@@ -512,7 +512,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Should emit COMPLETED, not QUEUED
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
@@ -529,5 +529,271 @@ class GatewayWorkerTest {
         assertEquals("worker-abc", worker.getWorkerId());
         assertEquals(List.of("echo-agent"), worker.getAgentTypes());
         assertNotNull(worker.getPluginRegistry());
+    }
+
+    // ---- J2+J3: suspension model and caller restoration -------------------
+
+    /** Suspends the way callAgent(waitForReply=true) does, then unwinds. */
+    private static class SuspendingWorker extends GatewayWorker {
+        SuspendingWorker(String workerId, RedisClient redisClient) {
+            super(workerId, redisClient);
+        }
+
+        @Override
+        public List<String> getAgentTypes() {
+            return List.of("echo-agent");
+        }
+
+        @Override
+        public Object processCommand(GatewayCommand command, AgentContext context) {
+            context.markSuspended(AgentState.WAITING_AGENT);
+            return AgentState.QUEUED;
+        }
+    }
+
+    /** Dispatches, then reaches a terminal state anyway — it owes a reply now. */
+    private static class SuspendingThenDoneWorker extends GatewayWorker {
+        SuspendingThenDoneWorker(String workerId, RedisClient redisClient) {
+            super(workerId, redisClient);
+        }
+
+        @Override
+        public List<String> getAgentTypes() {
+            return List.of("echo-agent");
+        }
+
+        @Override
+        public Object processCommand(GatewayCommand command, AgentContext context) {
+            context.markSuspended(AgentState.WAITING_AGENT);
+            return AgentState.COMPLETED;
+        }
+    }
+
+    private List<String> ctrlStreamWrites() {
+        ArgumentCaptor<String> streamCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
+        // atLeast(0): a suspended execution legitimately writes nothing at all,
+        // and that is exactly what one of these tests asserts.
+        verify(jedis, atLeast(0)).xadd(streamCaptor.capture(), any(XAddParams.class), fieldsCaptor.capture());
+        List<String> out = new java.util.ArrayList<>();
+        for (int i = 0; i < streamCaptor.getAllValues().size(); i++) {
+            if (streamCaptor.getAllValues().get(i).startsWith(Constants.QueueNames.ctrlStream(""))
+                    || streamCaptor.getAllValues().get(i).contains(":ctrl:")) {
+                out.add(fieldsCaptor.getAllValues().get(i).get("data"));
+            }
+        }
+        return out;
+    }
+
+    private static ResumeCommand resumeFromSubAgent() {
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b")            // B's own id: what B reattaches by
+                        .sessionId("sess-1")
+                        .traceId("trace-1")
+                        .sourceAgentType("agent-c")    // the SUB-agent that just finished
+                        .targetAgentType("echo-agent")
+                        .parentMessageId("msg-c")      // B's sub-task
+                        .build(),
+                "sub result", AgentState.COMPLETED, Map.of("from", "c"), Map.of());
+    }
+
+    private static Map<String, Object> callerRecord() {
+        Map<String, Object> record = new java.util.HashMap<>();
+        record.put("execution_id", "exec-b");
+        record.put("source_agent_type", "agent-a");   // the REAL caller
+        record.put("parent_message_id", "msg-a");     // A's own id
+        record.put("task_group_id", "");
+        return record;
+    }
+
+    @Test
+    void aResumedExecutionRepliesToItsOriginalCallerNotToTheSubAgent() {
+        EchoWorker worker = new EchoWorker("worker-1", redisClient);
+
+        worker.handleMessage(resumeFromSubAgent(), "exec-b", callerRecord(), true);
+
+        List<String> replies = ctrlStreamWrites();
+        assertFalse(replies.isEmpty(), "a resumed execution must reply to its caller");
+        String reply = replies.get(replies.size() - 1);
+        // Addressed to A, not back down to C.
+        assertTrue(reply.contains("agent-a"), "reply must be addressed to the original caller");
+        // And keyed by A's own message id, or A cannot reattach its execution.
+        assertTrue(reply.contains("msg-a"), "reply must carry the caller's own message id");
+    }
+
+    @Test
+    void aMissingSourceAgentTypeMeansNoCallerRatherThanAnError() {
+        // Java's execution records historically omit the field entirely, so
+        // absence is the common case — it must read as "nobody is waiting".
+        EchoWorker worker = new EchoWorker("worker-1", redisClient);
+        Map<String, Object> record = new java.util.HashMap<>();
+        record.put("execution_id", "exec-b");
+
+        assertDoesNotThrow(() -> worker.handleMessage(resumeFromSubAgent(), "exec-b", record, true));
+        assertNull(GatewayWorker.resolveReplyCommand(resumeFromSubAgent(), record));
+    }
+
+    @Test
+    void theClientSentinelIsNotACaller() {
+        // Treating it as one posts to a control stream nobody consumes AND
+        // suppresses the end-of-stream event the front end waits on.
+        Map<String, Object> record = new java.util.HashMap<>();
+        record.put("source_agent_type", Constants.CLIENT_SOURCE_AGENT_TYPE);
+
+        assertNull(GatewayWorker.resolveReplyCommand(resumeFromSubAgent(), record));
+    }
+
+    @Test
+    void aSuspendedExecutionDoesNotReplyYet() {
+        // The value a handler returns merely to unwind is not a result. Sending
+        // it wakes the caller early and burns the single reply it is parked on.
+        SuspendingWorker worker = new SuspendingWorker("worker-1", redisClient);
+        AskAgentCommand dispatch = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
+                        .sourceAgentType("agent-a").targetAgentType("echo-agent")
+                        .parentMessageId("msg-a").build(),
+                "delegate", false, null);
+
+        worker.handleMessage(dispatch, "exec-b", null, false);
+
+        for (String written : ctrlStreamWrites()) {
+            assertFalse(written.contains("\"action_type\":\"RESUME\""),
+                    "a suspended execution must not reply to its caller yet");
+        }
+    }
+
+    @Test
+    void aTerminalStatusOverridesSuspensionAndRepliesNow() {
+        // It dispatched, then finished anyway: no resume is coming, so this is
+        // the caller's only chance to hear anything.
+        SuspendingThenDoneWorker worker = new SuspendingThenDoneWorker("worker-1", redisClient);
+        AskAgentCommand dispatch = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
+                        .sourceAgentType("agent-a").targetAgentType("echo-agent")
+                        .parentMessageId("msg-a").build(),
+                "delegate", false, null);
+
+        worker.handleMessage(dispatch, "exec-b", null, false);
+
+        boolean replied = ctrlStreamWrites().stream().anyMatch(w -> w.contains("agent-a"));
+        assertTrue(replied, "a handler that reached a terminal state owes its caller a reply now");
+    }
+
+    // ---- J4+J5: metadata, two directions ----------------------------------
+
+    /** Records what the handler was actually handed. */
+    private static class MetadataInspectWorker extends GatewayWorker {
+        volatile Map<String, Object> seenMetadata;
+
+        MetadataInspectWorker(String workerId, RedisClient redisClient) {
+            super(workerId, redisClient);
+        }
+
+        @Override
+        public List<String> getAgentTypes() {
+            return List.of("echo-agent");
+        }
+
+        @Override
+        public Object processCommand(GatewayCommand command, AgentContext context) {
+            seenMetadata = new java.util.HashMap<>(command.header().metadata());
+            return AgentState.COMPLETED;
+        }
+    }
+
+    private static ResumeCommand resumeWithMetadata(Map<String, Object> wakingMetadata) {
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
+                        .sourceAgentType("agent-c").targetAgentType("echo-agent")
+                        .parentMessageId("msg-c").metadata(wakingMetadata).build(),
+                "sub result", AgentState.COMPLETED, Map.of("from", "c"), Map.of());
+    }
+
+    private static Map<String, Object> recordWithMetadata(Map<String, Object> stored) {
+        Map<String, Object> record = callerRecord();
+        record.put("metadata", stored);
+        return record;
+    }
+
+    @Test
+    void aResumedHandlerReadsItsOwnDispatchMetadataAgain() {
+        // Inbound: merged, not replaced. This agent IS the addressee of the
+        // waking message, so that message's metadata is payload here.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("answer", "Pink", "tag", "from-waking")),
+                "exec-b",
+                recordWithMetadata(Map.of("tenant", "acme", "tag", "from-dispatch")),
+                true);
+
+        assertEquals("acme", worker.seenMetadata.get("tenant"));
+        assertEquals("Pink", worker.seenMetadata.get("answer"));
+        // The newer, more specific hop wins the collision.
+        assertEquals("from-waking", worker.seenMetadata.get("tag"));
+    }
+
+    @Test
+    void theInboundRestoreDropsTheSnapshotsStaleTraceKeys() {
+        // A Java-only deployment never puts these in metadata, but a Python
+        // caller setdefaults them in — so a mixed chain does carry stale span ids.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+        Map<String, Object> stored = new java.util.HashMap<>();
+        stored.put("tenant", "acme");
+        stored.put("trace_parent_span_id", "stale-trace");
+        stored.put("framework_parent_span_id", "stale-framework");
+        stored.put("langfuse_parent_observation_id", "stale-langfuse");
+
+        worker.handleMessage(resumeWithMetadata(Map.of()), "exec-b", recordWithMetadata(stored), true);
+
+        assertEquals(Map.of("tenant", "acme"), worker.seenMetadata);
+    }
+
+    @Test
+    void theInboundRestoreDegradesWhenTheRecordHasNoMetadata() {
+        // Records written before the field existed, or by another SDK.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("client_tag", "t")), "exec-b", callerRecord(), true);
+
+        assertEquals(Map.of("client_tag", "t"), worker.seenMetadata);
+    }
+
+    @Test
+    void theOutboundReplyCarriesTheCallersMetadataAndNotTheWakingHops() {
+        // Outbound: full REPLACEMENT. The two directions share a record, not a rule.
+        EchoWorker worker = new EchoWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("from_c", "should-not-leak")),
+                "exec-b",
+                recordWithMetadata(Map.of("caller", "agent-a-original")),
+                true);
+
+        List<String> replies = ctrlStreamWrites();
+        assertFalse(replies.isEmpty());
+        String reply = replies.get(replies.size() - 1);
+        assertTrue(reply.contains("agent-a-original"), "the caller's own metadata must come back");
+        assertFalse(reply.contains("should-not-leak"), "the waking hop's metadata must not reach the caller");
+    }
+
+    @Test
+    void theInboundMergeDoesNotMutateTheCommandTheReplyIsBuiltFrom() {
+        // resolveReplyCommand reads the raw command, so an in-place header
+        // rewrite here would leak the inbound merge into the outbound reply.
+        ResumeCommand raw = resumeWithMetadata(new java.util.HashMap<>(Map.of("answer", "Pink")));
+        Map<String, Object> record = recordWithMetadata(Map.of("tenant", "acme"));
+
+        GatewayCommand restored = GatewayWorker.restoreInboundMetadata(raw, record);
+
+        assertEquals(Map.of("answer", "Pink"), raw.header().metadata(),
+                "the raw command must be untouched");
+        assertEquals("acme", restored.header().metadata().get("tenant"));
+        assertNotSame(raw, restored);
     }
 }

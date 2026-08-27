@@ -11,6 +11,7 @@ import com.iwhaleai.byai.framework.core.protocol.EvictWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommandFactory;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import org.slf4j.Logger;
@@ -369,15 +370,42 @@ public class WorkerRunner {
                 // 2. Business Replay protection (Idempotency)
                 Map<String, Object> existing = worker.registry.getExecutionByMessageId(header.messageId(),
                         header.sessionId());
+                boolean isResumeCommand = command instanceof ResumeCommand;
                 if (existing != null) {
                     String status = String.valueOf(existing.get(Constants.ExecutionFields.STATUS));
-                    if (Constants.TERMINAL_STATES.contains(status)) {
+                    // A ResumeCommand is exempt: a handler that reached a terminal
+                    // state after dispatching is a case the framework keeps alive on
+                    // purpose, and its record is terminal by then. Skipping here would
+                    // silently drop the very reply that execution is waiting on.
+                    // Mirrors Python runner.py's `and not isinstance(command, ResumeCommand)`.
+                    if (Constants.TERMINAL_STATES.contains(status) && !isResumeCommand) {
                         LOG.info("[{}] Skipping terminal replay: {} -> {}", worker.workerId, header.messageId(),
                                 status);
                         streamOps.xack(streamName, groupName, entry.getID());
                         return;
                     }
                 }
+
+                // A resume that resolves to no execution starts a new, disconnected
+                // one instead of continuing the suspended original. Nothing else
+                // surfaces that, so it must be logged — it is the only diagnostic
+                // for this defect class (Python and TS both carry the same warning).
+                if (isResumeCommand && existing == null) {
+                    LOG.warn("[{}] ResumeCommand did not resolve to an existing execution "
+                            + "(message_id={}, session_id={}); starting a new, disconnected "
+                            + "execution instead of continuing the suspended one.",
+                            worker.workerId, header.messageId(), header.sessionId());
+                }
+
+                // QUEUED is the only status an execution can carry while it is still
+                // waiting to be picked up for the FIRST time. Anything else means it
+                // has already been through a worker, so its identity must be restored
+                // from the record rather than re-derived from the message header.
+                // Mirrors Python runner.py's is_resumed_execution.
+                boolean isResumedExecution = isResumeCommand
+                        || (existing != null
+                                && !AgentState.QUEUED.equals(
+                                        String.valueOf(existing.get(Constants.ExecutionFields.STATUS))));
 
                 // 3. Generate/Reuse Execution ID
                 String executionId = existing != null
@@ -392,8 +420,26 @@ public class WorkerRunner {
                     // 5. Update execution status to RUNNING with worker_id
                     if (existing != null) {
                         // Execution was pre-initialized (e.g. by client), update to RUNNING
+                        Map<String, Object> statusFields = new HashMap<>();
+                        statusFields.put(Constants.ExecutionFields.WORKER_ID, worker.workerId);
+                        if (!isResumeCommand) {
+                            // The dispatch metadata, recorded by whoever is EXECUTING
+                            // the message rather than by whoever sent it:
+                            // header.metadata IS the dispatch metadata by definition,
+                            // so this is correct for every dispatcher — including a
+                            // client root dispatch and a Python/TS caller, none of
+                            // which writes the field into a Java-visible record.
+                            // handleMessage reads it back to restore what this
+                            // execution was originally asked for once it resumes.
+                            //
+                            // A ResumeCommand must NOT write it: the waking message's
+                            // metadata would overwrite the very original this exists
+                            // to preserve, and nothing else keeps a copy.
+                            statusFields.put("metadata",
+                                    header.metadata() != null ? new HashMap<>(header.metadata()) : Map.of());
+                        }
                         worker.registry.updateExecutionStatus(executionId, header.sessionId(),
-                                AgentState.RUNNING, Map.of(Constants.ExecutionFields.WORKER_ID, worker.workerId));
+                                AgentState.RUNNING, statusFields);
                     } else {
                         // No pre-existing execution, create a new one
                         Map<String, Object> execution = new HashMap<>();
@@ -403,6 +449,12 @@ public class WorkerRunner {
                         execution.put(Constants.ExecutionFields.WORKER_ID, worker.workerId);
                         execution.put(Constants.ExecutionFields.TARGET_AGENT_TYPE, header.targetAgentType());
                         execution.put(Constants.ExecutionFields.STATUS, AgentState.RUNNING);
+                        // Same reason as the update branch above. This is the
+                        // no-existing-record fallback, so there is no stored original
+                        // to protect and no ResumeCommand guard to make: whatever
+                        // woke this is all this execution has ever been told.
+                        execution.put("metadata",
+                                header.metadata() != null ? new HashMap<>(header.metadata()) : Map.of());
                         execution.put(Constants.ExecutionFields.CREATED_AT, System.currentTimeMillis());
                         if (header.parentMessageId() != null && !header.parentMessageId().isEmpty()) {
                             execution.put("parent_message_id", header.parentMessageId());
@@ -410,8 +462,11 @@ public class WorkerRunner {
                         worker.registry.saveExecution(execution);
                     }
 
-                    // 6. Handle message
-                    worker.handleMessage(command, executionId);
+                    // 6. Handle message. The execution record travels with it: a
+                    // resumed execution's caller, and the metadata it was originally
+                    // dispatched with, can only be read back from there — the waking
+                    // ResumeCommand's own header describes the hop that just finished.
+                    worker.handleMessage(command, executionId, existing, isResumedExecution);
 
                     // 7. ACK
                     streamOps.xack(streamName, groupName, entry.getID());

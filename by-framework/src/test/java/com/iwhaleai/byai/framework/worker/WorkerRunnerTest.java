@@ -1,9 +1,13 @@
 package com.iwhaleai.byai.framework.worker;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import com.iwhaleai.byai.framework.common.Constants;
 import com.iwhaleai.byai.framework.common.RedisClient;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
+import com.iwhaleai.byai.framework.core.protocol.AskAgentCommand;
 import com.iwhaleai.byai.framework.core.protocol.GatewayCommand;
+import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
+import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -14,6 +18,7 @@ import redis.clients.jedis.CommandArguments;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Protocol;
 import redis.clients.jedis.StreamEntryID;
+import redis.clients.jedis.resps.StreamEntry;
 import redis.clients.jedis.params.SetParams;
 import redis.clients.jedis.params.XReadGroupParams;
 
@@ -74,6 +79,55 @@ class WorkerRunnerTest {
         public Object processCommand(GatewayCommand command, AgentContext context) {
             return "ok";
         }
+    }
+
+    /**
+     * Records what reached handleMessage, so a test can tell "skipped" from
+     * "processed" without reaching into the executor.
+     */
+    private static class RecordingWorker extends GatewayWorker {
+        final java.util.concurrent.CountDownLatch handled = new java.util.concurrent.CountDownLatch(1);
+
+        boolean await5() throws InterruptedException {
+            return handled.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        volatile Map<String, Object> seenExistingExecution;
+        volatile boolean seenIsResumed;
+
+        RecordingWorker(String workerId, RedisClient redisClient, WorkerRegistry registry) {
+            super(workerId, redisClient, registry);
+        }
+
+        @Override
+        public List<String> getAgentTypes() {
+            return List.of("simple-agent");
+        }
+
+        @Override
+        public Object processCommand(GatewayCommand command, AgentContext context) {
+            return "ok";
+        }
+
+        @Override
+        public void handleMessage(GatewayCommand command, String executionId,
+                Map<String, Object> existingExecution, boolean isResumedExecution) {
+            this.seenExistingExecution = existingExecution;
+            this.seenIsResumed = isResumedExecution;
+            this.handled.countDown();
+        }
+    }
+
+    private static StreamEntry entryFor(GatewayCommand command) throws Exception {
+        String json = new ObjectMapper().writeValueAsString(command);
+        return new StreamEntry(new StreamEntryID("1-0"),
+                Map.of(Constants.RedisFields.DATA, json));
+    }
+
+    private static void drive(WorkerRunner runner, String streamName, StreamEntry entry) throws Exception {
+        java.lang.reflect.Method m = WorkerRunner.class.getDeclaredMethod(
+                "processMessageAsync", String.class, StreamEntry.class);
+        m.setAccessible(true);
+        m.invoke(runner, streamName, entry);
     }
 
     @BeforeEach
@@ -376,5 +430,178 @@ class WorkerRunnerTest {
             }
         }
         assertTrue(sawBlockingRead, "expected at least one phase-two blocking read");
+    }
+
+    // ---- J1: the resume path's two silent defects -------------------------
+
+    @Test
+    void terminalReplaySkipMustExemptAResumeCommand() throws Exception {
+        // A handler that reaches a terminal state AFTER dispatching is a case the
+        // framework keeps alive on purpose, so its record is terminal by the time
+        // the reply arrives. Skipping that reply as a "terminal replay" silently
+        // drops the very thing the execution is waiting on.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-b"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-b",
+                        Constants.ExecutionFields.STATUS, "COMPLETED"));
+
+        ResumeCommand resume = ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent").build(),
+                "answer", "COMPLETED", null, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(resume));
+
+        assertTrue(worker.handled.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "a ResumeCommand must survive the terminal-replay guard");
+        assertTrue(worker.seenIsResumed, "a ResumeCommand is always a resumed execution");
+    }
+
+    @Test
+    void terminalReplayStillSkipsANonResumeCommand() throws Exception {
+        // The control: the guard itself must keep working. Only the resume case
+        // is exempt.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-a"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-a",
+                        Constants.ExecutionFields.STATUS, "COMPLETED"));
+
+        AskAgentCommand ask = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-a").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent").build(),
+                "hello", false, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(ask));
+
+        assertFalse(worker.handled.await(1, java.util.concurrent.TimeUnit.SECONDS),
+                "a terminal replay of a fresh dispatch must still be skipped");
+    }
+
+    @Test
+    void theExecutionRecordTravelsToTheWorker() throws Exception {
+        // The snapshot is the only place a resumed execution's caller and its
+        // original dispatch metadata survive; if it does not reach the worker,
+        // nothing downstream can restore either.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        Map<String, Object> record = Map.of(
+                Constants.ExecutionFields.EXECUTION_ID, "exec-b",
+                Constants.ExecutionFields.STATUS, "WAITING_USER",
+                "source_agent_type", "agent-a",
+                "metadata", Map.of("tenant", "acme"));
+        when(registry.getExecutionByMessageId(eq("msg-b"), eq("sess-1"))).thenReturn(record);
+
+        ResumeCommand resume = ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent").build(),
+                "answer", "COMPLETED", null, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(resume));
+
+        assertTrue(worker.handled.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertNotNull(worker.seenExistingExecution, "the execution record must reach handleMessage");
+        assertEquals("agent-a", worker.seenExistingExecution.get("source_agent_type"));
+    }
+
+    @Test
+    void aNonQueuedRecordCountsAsResumedEvenForAFreshDispatch() throws Exception {
+        // QUEUED is the only status an execution can hold before its first pickup.
+        // Anything else means it has already been through a worker, so its identity
+        // must come from the record rather than the header.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-a"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-a",
+                        Constants.ExecutionFields.STATUS, "RUNNING"));
+
+        AskAgentCommand ask = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-a").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent").build(),
+                "hello", false, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(ask));
+
+        assertTrue(worker.handled.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertTrue(worker.seenIsResumed, "a record past QUEUED means the execution already ran");
+    }
+
+    // ---- J6: the executing worker records its own dispatch metadata --------
+
+    @Test
+    void aFirstPickupRecordsTheDispatchMetadataOnTheExecution() throws Exception {
+        // header.metadata IS the dispatch metadata by definition, so recording it
+        // here is correct for every dispatcher — including ones that write no
+        // metadata onto the record themselves (a client root dispatch, a
+        // Python/TS caller).
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-a"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-a",
+                        Constants.ExecutionFields.STATUS, "QUEUED"));
+
+        AskAgentCommand ask = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-a").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent")
+                        .metadata(Map.of("tenant", "acme")).build(),
+                "hello", false, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(ask));
+
+        assertTrue(worker.await5());
+        ArgumentCaptor<Map<String, Object>> fields = ArgumentCaptor.forClass(Map.class);
+        verify(registry).updateExecutionStatus(eq("exec-a"), eq("sess-1"), eq("RUNNING"), fields.capture());
+        assertEquals(Map.of("tenant", "acme"), fields.getValue().get("metadata"));
+    }
+
+    @Test
+    void aResumeMustNotOverwriteTheRecordedDispatchMetadata() throws Exception {
+        // The record's metadata is the only copy of what this execution was
+        // originally dispatched with. Writing the waking message's over it on the
+        // way in destroys exactly what the restore exists to recover.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-b"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-b",
+                        Constants.ExecutionFields.STATUS, "WAITING_USER",
+                        "metadata", Map.of("tenant", "acme")));
+
+        ResumeCommand resume = ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent")
+                        .metadata(Map.of("client_tag", "this-hop-only")).build(),
+                "Pink", "COMPLETED", null, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(resume));
+
+        assertTrue(worker.await5());
+        ArgumentCaptor<Map<String, Object>> fields = ArgumentCaptor.forClass(Map.class);
+        verify(registry).updateExecutionStatus(eq("exec-b"), eq("sess-1"), eq("RUNNING"), fields.capture());
+        assertFalse(fields.getValue().containsKey("metadata"),
+                "a resume must leave the stored original alone");
     }
 }

@@ -224,7 +224,20 @@ public abstract class GatewayWorker {
         }
     }
 
-    public void handleMessage(GatewayCommand command, String executionId) {
+    /**
+     * Handle one business message.
+     *
+     * @param existingExecution the execution record this message resolved to, or
+     *        {@code null} when there is none. A resumed execution's caller and its
+     *        original dispatch metadata live here and nowhere else: the waking
+     *        ResumeCommand's own header describes the hop that just finished, not
+     *        the dispatch being answered. Mirrors Python's
+     *        {@code RunningExecution.existing_data}.
+     * @param isResumedExecution whether this execution has already been through a
+     *        worker — a ResumeCommand, or a record whose status is past QUEUED.
+     */
+    public void handleMessage(GatewayCommand command, String executionId,
+            Map<String, Object> existingExecution, boolean isResumedExecution) {
         if (command instanceof CancelTaskCommand cancelCmd) {
             onCancelTask(cancelCmd);
             return;
@@ -236,6 +249,17 @@ public abstract class GatewayWorker {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
 
+        // Give a resumed handler its own dispatch metadata back. The mirror image
+        // of resolveReplyCommand, and deliberately not the same rule: this agent
+        // IS the addressee of the waking message, so that message's metadata is
+        // real payload here rather than someone else's plumbing. Original
+        // dispatch metadata is the base, the waking message wins collisions.
+        //
+        // Builds a NEW command — never mutates. resolveReplyCommand below reads
+        // the raw one, so rewriting this header in place would leak the inbound
+        // merge into the reply that goes out.
+        GatewayCommand inboundCommand = restoreInboundMetadata(command, existingExecution);
+
         AgentContext context = new AgentContext(
                 header.sessionId(),
                 traceId,
@@ -245,8 +269,15 @@ public abstract class GatewayWorker {
         );
 
         boolean isResume = command instanceof ResumeCommand;
-        String sourceAgentType = header.sourceAgentType();
-        boolean hasSourceAgent = sourceAgentType != null && !sourceAgentType.isBlank() && !isResume;
+        // NOT `sourceAgentType != null && !isResume`: a resume's header names the
+        // sub-agent that just finished, so that predicate both denied every
+        // resumed execution a reply AND would have addressed one to the callee.
+        // resolveReplyCommand rebuilds the ORIGINAL dispatch header from the
+        // execution record instead; the whole reply — routing included — must be
+        // driven off that command, not off `command`.
+        GatewayCommand replyCommand = resolveReplyCommand(command, existingExecution);
+        boolean hasSourceAgent = replyCommand != null;
+        String sourceAgentType = hasSourceAgent ? replyCommand.header().sourceAgentType() : "";
 
         LOG.info("[{}] Processing message: {} (exec: {})", workerId, header.messageId(), executionId);
 
@@ -259,16 +290,31 @@ public abstract class GatewayWorker {
                 }
             }
 
-            Object result = processCommand(command, context);
+            // inboundCommand, not command: the handler reads what this execution
+            // was originally dispatched with, merged under the waking message's
+            // own metadata.
+            Object result = processCommand(inboundCommand, context);
             AgentTaskResult taskResult = AgentTaskResult.normalize(result);
             String finalStatus = taskResult.status();
 
+            // A suspended execution has no result yet — only the value the handler
+            // returned so it could unwind. Forwarding that wakes the caller early
+            // with a placeholder AND burns the single reply it was parked on; the
+            // real result goes out when this execution resumes and finishes.
+            //
+            // The terminal-status exception is load-bearing: a handler that
+            // reached COMPLETED/FAILED/CANCELLED after dispatching is finished and
+            // will never be resumed to reply later, so it owes its caller a reply
+            // NOW. Without it such an execution would record itself done and stay
+            // silent, suspending its caller until a sweep bails it out.
+            boolean isSuspended = context.isSuspended() && !AgentState.isTerminalState(finalStatus);
+
             boolean permissionTransferred = false;
-            if (hasSourceAgent) {
+            if (hasSourceAgent && !isSuspended) {
                 permissionTransferred = true;
-                enqueueAgentReturn(command, taskResult);
+                enqueueAgentReturn(replyCommand, taskResult);
                 context.emitState(AgentState.QUEUED + ": " + sourceAgentType);
-            } else {
+            } else if (!hasSourceAgent) {
                 context.emitState(AgentState.COMPLETED);
             }
 
@@ -316,7 +362,7 @@ public abstract class GatewayWorker {
                     }
 
                     if (shouldCallback) {
-                        enqueueAgentReturn(command, "CANCELLED", Map.of("reason", reason));
+                        enqueueAgentReturn(replyCommand, "CANCELLED", Map.of("reason", reason));
                         permissionTransferred = true;
                     }
                 }
@@ -336,7 +382,7 @@ public abstract class GatewayWorker {
             LOG.error("[{}] Task failed: {}", workerId, e.getMessage() != null ? e.getMessage() : e.getClass().getName());
             boolean permissionTransferred = false;
             if (hasSourceAgent) {
-                enqueueAgentReturn(command, "FAILED", Map.of("error", e.getMessage() != null ? e.getMessage() : "Unknown error"));
+                enqueueAgentReturn(replyCommand, "FAILED", Map.of("error", e.getMessage() != null ? e.getMessage() : "Unknown error"));
                 permissionTransferred = true;
             }
             context.emitState(AgentState.FAILED + ": " + e.getMessage());
@@ -414,6 +460,124 @@ public abstract class GatewayWorker {
         }
     }
 
+    /**
+     * Return the command whose caller this execution owes a reply to, or
+     * {@code null} when nobody is waiting.
+     *
+     * For a fresh dispatch the answer is the command itself: its header's
+     * sourceAgentType is the caller.
+     *
+     * For a RESUME it is not. The ResumeCommand that woke us describes the hop
+     * that finished — its sourceAgentType is our SUB-agent and its
+     * parentMessageId is our sub-task — so replying against that header sends
+     * our result back down to the sub-agent we just called. The caller is
+     * whatever the ORIGINAL dispatch recorded in the execution registry, which
+     * is why this rebuilds the dispatch header from the execution record.
+     *
+     * Two ways to have no caller, and both must be handled as "no caller"
+     * rather than as an error:
+     *   - a MISSING source_agent_type. Java's execution records historically do
+     *     not write the field at all, so absence is the common case here, not a
+     *     corruption signal.
+     *   - the CLIENT_SOURCE_AGENT_TYPE sentinel, which is a marker and not an
+     *     agent type. Treating it as a caller posts the result to a control
+     *     stream nobody consumes AND suppresses the end-of-stream event the
+     *     front end is waiting on.
+     *
+     * Mirrors Python worker.py's _resolve_reply_command.
+     */
+    static GatewayCommand resolveReplyCommand(GatewayCommand command, Map<String, Object> existingExecution) {
+        MessageHeader header = command.header();
+        if (!(command instanceof ResumeCommand)) {
+            return header.sourceAgentType() != null && !header.sourceAgentType().isBlank() ? command : null;
+        }
+
+        Map<String, Object> snapshot = existingExecution != null ? existingExecution : Map.of();
+        Object rawCaller = snapshot.get("source_agent_type");
+        String callerAgentType = rawCaller != null ? String.valueOf(rawCaller) : "";
+        if (callerAgentType.isBlank() || Constants.CLIENT_SOURCE_AGENT_TYPE.equals(callerAgentType)) {
+            return null;
+        }
+
+        Object rawParent = snapshot.get("parent_message_id");
+        Object rawGroup = snapshot.get("task_group_id");
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId(header.messageId())
+                        .sessionId(header.sessionId())
+                        .traceId(header.traceId())
+                        .sourceAgentType(callerAgentType)
+                        .targetAgentType(header.targetAgentType())
+                        .parentMessageId(rawParent != null ? String.valueOf(rawParent) : "")
+                        .taskGroupId(rawGroup != null ? String.valueOf(rawGroup) : "")
+                        .userCode(header.userCode())
+                        .userName(header.userName())
+                        // REPLACEMENT, not a merge with header.metadata: that
+                        // metadata belongs to whatever woke this execution up (an
+                        // askUser answer, or a sub-call's reply), not to the
+                        // original caller. Leaking it would let a transient hop
+                        // overwrite the caller's own data instead of being layered
+                        // under taskResult.metadata, which enqueueAgentReturn's
+                        // merge already does correctly. A record with no stored
+                        // metadata degrades to empty — never to the waking hop's.
+                        .metadata(ResumeMetadata.storedMetadata(existingExecution))
+                        .build(),
+                ((ResumeCommand) command).content(),
+                ((ResumeCommand) command).status(),
+                ((ResumeCommand) command).replyData(),
+                new HashMap<>(((ResumeCommand) command).extraPayload()));
+    }
+
+    /**
+     * Give a resumed handler its own dispatch metadata back.
+     *
+     * <p>The mirror image of {@link #resolveReplyCommand}, and deliberately not
+     * the same rule. That one rebuilds the header this execution <i>sends</i>;
+     * this one rebuilds the header it <i>reads</i>. A resumed handler otherwise
+     * sees only the metadata of whatever woke it up — an askUser answer's, or a
+     * sub-call's reply — and everything the execution was originally dispatched
+     * with is gone from the moment it first suspends.
+     *
+     * <p>Merged, not replaced (the opposite of the outbound direction): this
+     * agent IS the addressee of the waking message, so its metadata is real
+     * payload here rather than someone else's plumbing. See {@link ResumeMetadata}
+     * for why the framework's per-hop trace keys are excluded from the base.
+     *
+     * <p>Returns a NEW command — never mutates. The caller keeps the raw one for
+     * {@link #resolveReplyCommand}, so mutating here would leak the inbound merge
+     * into the reply that goes out.
+     *
+     * <p>Mirrors Python worker.py's _restore_inbound_metadata.
+     */
+    static GatewayCommand restoreInboundMetadata(
+            GatewayCommand command, Map<String, Object> existingExecution) {
+        if (!(command instanceof ResumeCommand resume)) {
+            return command;
+        }
+        MessageHeader header = command.header();
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId(header.messageId())
+                        .sessionId(header.sessionId())
+                        .traceId(header.traceId())
+                        .sourceAgentType(header.sourceAgentType())
+                        .targetAgentType(header.targetAgentType())
+                        .parentMessageId(header.parentMessageId())
+                        .taskGroupId(header.taskGroupId())
+                        .userCode(header.userCode())
+                        .userName(header.userName())
+                        .metadata(ResumeMetadata.mergeResumeMetadata(
+                                ResumeMetadata.storedMetadata(existingExecution),
+                                header.metadata()))
+                        .traceParentSpanId(header.traceParentSpanId())
+                        .langfuseParentObservationId(header.langfuseParentObservationId())
+                        .build(),
+                resume.content(),
+                resume.status(),
+                resume.replyData(),
+                new HashMap<>(resume.extraPayload()));
+    }
+
     private void enqueueAgentReturn(GatewayCommand command, String status, Object replyData) {
         enqueueAgentReturn(command, new AgentTaskResult(status, "", replyData, Map.of(), Map.of()));
     }
@@ -428,7 +592,13 @@ public abstract class GatewayWorker {
 
         ResumeCommand callbackMsg = ResumeCommand.of(
                 MessageHeader.builder()
-                        .messageId("msg-" + UUID.randomUUID().toString().substring(0, 8))
+                        // The caller reattaches its suspended execution by this
+                        // id, so it must be the caller's OWN message id — this
+                        // dispatch's parentMessageId. A freshly minted id resolves
+                        // to no execution and orphans the caller.
+                        .messageId(header.parentMessageId() != null && !header.parentMessageId().isBlank()
+                                ? header.parentMessageId()
+                                : Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8))
                         .sessionId(header.sessionId())
                         .traceId(header.traceId())
                         .sourceAgentType(header.targetAgentType() != null ? header.targetAgentType() : workerId)
