@@ -15,6 +15,7 @@ import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
 import com.iwhaleai.byai.framework.core.liveness.WaitGate;
+import com.iwhaleai.byai.framework.core.liveness.WaitSweeper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import redis.clients.jedis.resps.StreamEntry;
@@ -56,6 +57,7 @@ public class WorkerRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean evictionHandled = new AtomicBoolean(false);
     private String lockToken;
+    private WaitSweeper waitSweeper;
 
     // Round-robin cursor for the agent_type phase-two blocking primary.
     // Only ever touched by the single agent_type loop thread.
@@ -156,6 +158,16 @@ public class WorkerRunner {
         }
 
         LOG.info("[{}] Runner started, waiting for tasks...", worker.workerId);
+
+        // Best-effort: a background component that fails to construct must never
+        // stop the worker from consuming. The sweep is a safety net, not a
+        // dependency of the happy path.
+        try {
+            waitSweeper = new WaitSweeper(redisOps, worker.workerId);
+            waitSweeper.start();
+        } catch (Exception e) {
+            LOG.warn("[{}] WaitSweeper failed to start: {}", worker.workerId, e.getMessage());
+        }
 
         new Thread(this::runAgentTypeLoop, "runner-loop-" + worker.workerId).start();
         new Thread(this::runWorkerCtrlLoop, "runner-worker-ctrl-loop-" + worker.workerId).start();
@@ -576,6 +588,10 @@ public class WorkerRunner {
     public void stop() {
         if (!running.compareAndSet(true, false)) {
             return; // Already stopped
+        }
+
+        if (waitSweeper != null) {
+            waitSweeper.stop();
         }
 
         worker.stopHeartbeat();
