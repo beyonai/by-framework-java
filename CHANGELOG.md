@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than whatever the handler returned while unwinding. Visible on the execution
   record and in the dashboard; `QUEUED` now means only "not yet picked up".
 
+### Added
+- A background sweep over the wait index, started with the worker. Its two
+  halves are independent switches: **pruning is on by default**
+  (`BY_FRAMEWORK_WAIT_PRUNE_ENABLED`) because nothing else ever removes a
+  wait-index entry, so with compensation off every call whose reply never
+  arrives would leave one behind forever in a structure with no TTL of its own.
+  **Compensation is off by default** (`BY_FRAMEWORK_WAIT_SWEEPER_ENABLED`) and is
+  the rollback switch for the whole liveness feature; it is not implemented yet.
+
 ### Changed
 - A Task Group member whose target agent type has no online worker is no longer
   dispatched. It previously went out blind, so that member never replied and the
