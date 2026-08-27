@@ -249,6 +249,17 @@ public abstract class GatewayWorker {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
 
+        // Give a resumed handler its own dispatch metadata back. The mirror image
+        // of resolveReplyCommand, and deliberately not the same rule: this agent
+        // IS the addressee of the waking message, so that message's metadata is
+        // real payload here rather than someone else's plumbing. Original
+        // dispatch metadata is the base, the waking message wins collisions.
+        //
+        // Builds a NEW command — never mutates. resolveReplyCommand below reads
+        // the raw one, so rewriting this header in place would leak the inbound
+        // merge into the reply that goes out.
+        GatewayCommand inboundCommand = restoreInboundMetadata(command, existingExecution);
+
         AgentContext context = new AgentContext(
                 header.sessionId(),
                 traceId,
@@ -279,7 +290,10 @@ public abstract class GatewayWorker {
                 }
             }
 
-            Object result = processCommand(command, context);
+            // inboundCommand, not command: the handler reads what this execution
+            // was originally dispatched with, merged under the waking message's
+            // own metadata.
+            Object result = processCommand(inboundCommand, context);
             AgentTaskResult taskResult = AgentTaskResult.normalize(result);
             String finalStatus = taskResult.status();
 
@@ -498,12 +512,70 @@ public abstract class GatewayWorker {
                         .taskGroupId(rawGroup != null ? String.valueOf(rawGroup) : "")
                         .userCode(header.userCode())
                         .userName(header.userName())
-                        .metadata(header.metadata())
+                        // REPLACEMENT, not a merge with header.metadata: that
+                        // metadata belongs to whatever woke this execution up (an
+                        // askUser answer, or a sub-call's reply), not to the
+                        // original caller. Leaking it would let a transient hop
+                        // overwrite the caller's own data instead of being layered
+                        // under taskResult.metadata, which enqueueAgentReturn's
+                        // merge already does correctly. A record with no stored
+                        // metadata degrades to empty — never to the waking hop's.
+                        .metadata(ResumeMetadata.storedMetadata(existingExecution))
                         .build(),
                 ((ResumeCommand) command).content(),
                 ((ResumeCommand) command).status(),
                 ((ResumeCommand) command).replyData(),
                 new HashMap<>(((ResumeCommand) command).extraPayload()));
+    }
+
+    /**
+     * Give a resumed handler its own dispatch metadata back.
+     *
+     * <p>The mirror image of {@link #resolveReplyCommand}, and deliberately not
+     * the same rule. That one rebuilds the header this execution <i>sends</i>;
+     * this one rebuilds the header it <i>reads</i>. A resumed handler otherwise
+     * sees only the metadata of whatever woke it up — an askUser answer's, or a
+     * sub-call's reply — and everything the execution was originally dispatched
+     * with is gone from the moment it first suspends.
+     *
+     * <p>Merged, not replaced (the opposite of the outbound direction): this
+     * agent IS the addressee of the waking message, so its metadata is real
+     * payload here rather than someone else's plumbing. See {@link ResumeMetadata}
+     * for why the framework's per-hop trace keys are excluded from the base.
+     *
+     * <p>Returns a NEW command — never mutates. The caller keeps the raw one for
+     * {@link #resolveReplyCommand}, so mutating here would leak the inbound merge
+     * into the reply that goes out.
+     *
+     * <p>Mirrors Python worker.py's _restore_inbound_metadata.
+     */
+    static GatewayCommand restoreInboundMetadata(
+            GatewayCommand command, Map<String, Object> existingExecution) {
+        if (!(command instanceof ResumeCommand resume)) {
+            return command;
+        }
+        MessageHeader header = command.header();
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId(header.messageId())
+                        .sessionId(header.sessionId())
+                        .traceId(header.traceId())
+                        .sourceAgentType(header.sourceAgentType())
+                        .targetAgentType(header.targetAgentType())
+                        .parentMessageId(header.parentMessageId())
+                        .taskGroupId(header.taskGroupId())
+                        .userCode(header.userCode())
+                        .userName(header.userName())
+                        .metadata(ResumeMetadata.mergeResumeMetadata(
+                                ResumeMetadata.storedMetadata(existingExecution),
+                                header.metadata()))
+                        .traceParentSpanId(header.traceParentSpanId())
+                        .langfuseParentObservationId(header.langfuseParentObservationId())
+                        .build(),
+                resume.content(),
+                resume.status(),
+                resume.replyData(),
+                new HashMap<>(resume.extraPayload()));
     }
 
     private void enqueueAgentReturn(GatewayCommand command, String status, Object replyData) {

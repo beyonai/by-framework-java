@@ -681,4 +681,119 @@ class GatewayWorkerTest {
         boolean replied = ctrlStreamWrites().stream().anyMatch(w -> w.contains("agent-a"));
         assertTrue(replied, "a handler that reached a terminal state owes its caller a reply now");
     }
+
+    // ---- J4+J5: metadata, two directions ----------------------------------
+
+    /** Records what the handler was actually handed. */
+    private static class MetadataInspectWorker extends GatewayWorker {
+        volatile Map<String, Object> seenMetadata;
+
+        MetadataInspectWorker(String workerId, RedisClient redisClient) {
+            super(workerId, redisClient);
+        }
+
+        @Override
+        public List<String> getAgentTypes() {
+            return List.of("echo-agent");
+        }
+
+        @Override
+        public Object processCommand(GatewayCommand command, AgentContext context) {
+            seenMetadata = new java.util.HashMap<>(command.header().metadata());
+            return AgentState.COMPLETED;
+        }
+    }
+
+    private static ResumeCommand resumeWithMetadata(Map<String, Object> wakingMetadata) {
+        return ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
+                        .sourceAgentType("agent-c").targetAgentType("echo-agent")
+                        .parentMessageId("msg-c").metadata(wakingMetadata).build(),
+                "sub result", AgentState.COMPLETED, Map.of("from", "c"), Map.of());
+    }
+
+    private static Map<String, Object> recordWithMetadata(Map<String, Object> stored) {
+        Map<String, Object> record = callerRecord();
+        record.put("metadata", stored);
+        return record;
+    }
+
+    @Test
+    void aResumedHandlerReadsItsOwnDispatchMetadataAgain() {
+        // Inbound: merged, not replaced. This agent IS the addressee of the
+        // waking message, so that message's metadata is payload here.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("answer", "Pink", "tag", "from-waking")),
+                "exec-b",
+                recordWithMetadata(Map.of("tenant", "acme", "tag", "from-dispatch")),
+                true);
+
+        assertEquals("acme", worker.seenMetadata.get("tenant"));
+        assertEquals("Pink", worker.seenMetadata.get("answer"));
+        // The newer, more specific hop wins the collision.
+        assertEquals("from-waking", worker.seenMetadata.get("tag"));
+    }
+
+    @Test
+    void theInboundRestoreDropsTheSnapshotsStaleTraceKeys() {
+        // A Java-only deployment never puts these in metadata, but a Python
+        // caller setdefaults them in — so a mixed chain does carry stale span ids.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+        Map<String, Object> stored = new java.util.HashMap<>();
+        stored.put("tenant", "acme");
+        stored.put("trace_parent_span_id", "stale-trace");
+        stored.put("framework_parent_span_id", "stale-framework");
+        stored.put("langfuse_parent_observation_id", "stale-langfuse");
+
+        worker.handleMessage(resumeWithMetadata(Map.of()), "exec-b", recordWithMetadata(stored), true);
+
+        assertEquals(Map.of("tenant", "acme"), worker.seenMetadata);
+    }
+
+    @Test
+    void theInboundRestoreDegradesWhenTheRecordHasNoMetadata() {
+        // Records written before the field existed, or by another SDK.
+        MetadataInspectWorker worker = new MetadataInspectWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("client_tag", "t")), "exec-b", callerRecord(), true);
+
+        assertEquals(Map.of("client_tag", "t"), worker.seenMetadata);
+    }
+
+    @Test
+    void theOutboundReplyCarriesTheCallersMetadataAndNotTheWakingHops() {
+        // Outbound: full REPLACEMENT. The two directions share a record, not a rule.
+        EchoWorker worker = new EchoWorker("worker-1", redisClient);
+
+        worker.handleMessage(
+                resumeWithMetadata(Map.of("from_c", "should-not-leak")),
+                "exec-b",
+                recordWithMetadata(Map.of("caller", "agent-a-original")),
+                true);
+
+        List<String> replies = ctrlStreamWrites();
+        assertFalse(replies.isEmpty());
+        String reply = replies.get(replies.size() - 1);
+        assertTrue(reply.contains("agent-a-original"), "the caller's own metadata must come back");
+        assertFalse(reply.contains("should-not-leak"), "the waking hop's metadata must not reach the caller");
+    }
+
+    @Test
+    void theInboundMergeDoesNotMutateTheCommandTheReplyIsBuiltFrom() {
+        // resolveReplyCommand reads the raw command, so an in-place header
+        // rewrite here would leak the inbound merge into the outbound reply.
+        ResumeCommand raw = resumeWithMetadata(new java.util.HashMap<>(Map.of("answer", "Pink")));
+        Map<String, Object> record = recordWithMetadata(Map.of("tenant", "acme"));
+
+        GatewayCommand restored = GatewayWorker.restoreInboundMetadata(raw, record);
+
+        assertEquals(Map.of("answer", "Pink"), raw.header().metadata(),
+                "the raw command must be untouched");
+        assertEquals("acme", restored.header().metadata().get("tenant"));
+        assertNotSame(raw, restored);
+    }
 }

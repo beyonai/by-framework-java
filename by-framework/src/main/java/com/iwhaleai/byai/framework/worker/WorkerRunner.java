@@ -420,8 +420,26 @@ public class WorkerRunner {
                     // 5. Update execution status to RUNNING with worker_id
                     if (existing != null) {
                         // Execution was pre-initialized (e.g. by client), update to RUNNING
+                        Map<String, Object> statusFields = new HashMap<>();
+                        statusFields.put(Constants.ExecutionFields.WORKER_ID, worker.workerId);
+                        if (!isResumeCommand) {
+                            // The dispatch metadata, recorded by whoever is EXECUTING
+                            // the message rather than by whoever sent it:
+                            // header.metadata IS the dispatch metadata by definition,
+                            // so this is correct for every dispatcher — including a
+                            // client root dispatch and a Python/TS caller, none of
+                            // which writes the field into a Java-visible record.
+                            // handleMessage reads it back to restore what this
+                            // execution was originally asked for once it resumes.
+                            //
+                            // A ResumeCommand must NOT write it: the waking message's
+                            // metadata would overwrite the very original this exists
+                            // to preserve, and nothing else keeps a copy.
+                            statusFields.put("metadata",
+                                    header.metadata() != null ? new HashMap<>(header.metadata()) : Map.of());
+                        }
                         worker.registry.updateExecutionStatus(executionId, header.sessionId(),
-                                AgentState.RUNNING, Map.of(Constants.ExecutionFields.WORKER_ID, worker.workerId));
+                                AgentState.RUNNING, statusFields);
                     } else {
                         // No pre-existing execution, create a new one
                         Map<String, Object> execution = new HashMap<>();
@@ -431,6 +449,12 @@ public class WorkerRunner {
                         execution.put(Constants.ExecutionFields.WORKER_ID, worker.workerId);
                         execution.put(Constants.ExecutionFields.TARGET_AGENT_TYPE, header.targetAgentType());
                         execution.put(Constants.ExecutionFields.STATUS, AgentState.RUNNING);
+                        // Same reason as the update branch above. This is the
+                        // no-existing-record fallback, so there is no stored original
+                        // to protect and no ResumeCommand guard to make: whatever
+                        // woke this is all this execution has ever been told.
+                        execution.put("metadata",
+                                header.metadata() != null ? new HashMap<>(header.metadata()) : Map.of());
                         execution.put(Constants.ExecutionFields.CREATED_AT, System.currentTimeMillis());
                         if (header.parentMessageId() != null && !header.parentMessageId().isEmpty()) {
                             execution.put("parent_message_id", header.parentMessageId());

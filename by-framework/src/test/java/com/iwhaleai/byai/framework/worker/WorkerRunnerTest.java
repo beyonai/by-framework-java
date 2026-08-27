@@ -87,6 +87,10 @@ class WorkerRunnerTest {
      */
     private static class RecordingWorker extends GatewayWorker {
         final java.util.concurrent.CountDownLatch handled = new java.util.concurrent.CountDownLatch(1);
+
+        boolean await5() throws InterruptedException {
+            return handled.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
         volatile Map<String, Object> seenExistingExecution;
         volatile boolean seenIsResumed;
 
@@ -536,5 +540,68 @@ class WorkerRunnerTest {
 
         assertTrue(worker.handled.await(5, java.util.concurrent.TimeUnit.SECONDS));
         assertTrue(worker.seenIsResumed, "a record past QUEUED means the execution already ran");
+    }
+
+    // ---- J6: the executing worker records its own dispatch metadata --------
+
+    @Test
+    void aFirstPickupRecordsTheDispatchMetadataOnTheExecution() throws Exception {
+        // header.metadata IS the dispatch metadata by definition, so recording it
+        // here is correct for every dispatcher — including ones that write no
+        // metadata onto the record themselves (a client root dispatch, a
+        // Python/TS caller).
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-a"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-a",
+                        Constants.ExecutionFields.STATUS, "QUEUED"));
+
+        AskAgentCommand ask = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-a").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent")
+                        .metadata(Map.of("tenant", "acme")).build(),
+                "hello", false, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(ask));
+
+        assertTrue(worker.await5());
+        ArgumentCaptor<Map<String, Object>> fields = ArgumentCaptor.forClass(Map.class);
+        verify(registry).updateExecutionStatus(eq("exec-a"), eq("sess-1"), eq("RUNNING"), fields.capture());
+        assertEquals(Map.of("tenant", "acme"), fields.getValue().get("metadata"));
+    }
+
+    @Test
+    void aResumeMustNotOverwriteTheRecordedDispatchMetadata() throws Exception {
+        // The record's metadata is the only copy of what this execution was
+        // originally dispatched with. Writing the waking message's over it on the
+        // way in destroys exactly what the restore exists to recover.
+        WorkerRegistry registry = mock(WorkerRegistry.class);
+        RecordingWorker worker = new RecordingWorker("worker-1", redisClient, registry);
+        WorkerRunner runner = new WorkerRunner(worker, redisClient, "test-group");
+
+        when(registry.getExecutionByMessageId(eq("msg-b"), eq("sess-1")))
+                .thenReturn(Map.of(
+                        Constants.ExecutionFields.EXECUTION_ID, "exec-b",
+                        Constants.ExecutionFields.STATUS, "WAITING_USER",
+                        "metadata", Map.of("tenant", "acme")));
+
+        ResumeCommand resume = ResumeCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("simple-agent")
+                        .metadata(Map.of("client_tag", "this-hop-only")).build(),
+                "Pink", "COMPLETED", null, Map.of());
+
+        drive(runner, Constants.QueueNames.ctrlStream("simple-agent"), entryFor(resume));
+
+        assertTrue(worker.await5());
+        ArgumentCaptor<Map<String, Object>> fields = ArgumentCaptor.forClass(Map.class);
+        verify(registry).updateExecutionStatus(eq("exec-b"), eq("sess-1"), eq("RUNNING"), fields.capture());
+        assertFalse(fields.getValue().containsKey("metadata"),
+                "a resume must leave the stored original alone");
     }
 }

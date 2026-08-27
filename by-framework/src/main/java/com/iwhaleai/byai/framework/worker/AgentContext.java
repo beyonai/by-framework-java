@@ -423,9 +423,27 @@ public class AgentContext {
             throw new RuntimeException("Failed to enqueue agent call", e);
         }
 
-        // Initialize execution tracking for the dispatched task
+        // Initialize execution tracking for the dispatched task.
+        //
+        // source_agent_type, task_group_id and metadata are recorded here because
+        // the callee reads all three back off this record once it suspends and
+        // resumes: the ResumeCommand that wakes it describes the hop that just
+        // finished, not this dispatch. source_agent_type is written only when
+        // waitForReply — a fire-and-forget dispatch has nobody waiting, and
+        // recording a caller for it would make the callee reply to an execution
+        // that already moved on.
+        //
+        // The callee's own worker records the same metadata again on first pickup
+        // (see WorkerRunner). That is not redundant: this write is the only record
+        // that exists before the callee is ever picked up, which is what a wait
+        // sweep reads when the callee never starts.
         try {
-            workerRegistry.initializeExecution(executionId, msgId, sessionId, selectedAgentType, currentMessageId);
+            Map<String, Object> extraFields = new HashMap<>();
+            extraFields.put("source_agent_type", waitForReply ? currentAgentType : "");
+            extraFields.put("task_group_id", taskGroupId != null ? taskGroupId : "");
+            extraFields.put("metadata", metadata != null ? new HashMap<>(metadata) : new HashMap<>());
+            workerRegistry.initializeExecution(executionId, msgId, sessionId, selectedAgentType,
+                    currentMessageId, traceId, extraFields);
         } catch (Exception e) {
             log.warn("Failed to initialize execution tracking for callAgent: {}", e.getMessage());
         }
