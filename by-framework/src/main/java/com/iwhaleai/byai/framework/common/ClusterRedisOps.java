@@ -212,6 +212,11 @@ public class ClusterRedisOps implements RedisOps {
     }
 
     @Override
+    public Double zscore(String key, String member) {
+        return jedisCluster.zscore(key, member);
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         Set<String> result = new LinkedHashSet<>();
         ScanParams params = new ScanParams().match(pattern).count(100);

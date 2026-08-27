@@ -138,4 +138,13 @@ public interface RedisOps {
 
     /** ZREMRANGEBYSCORE, returning the number of members removed. */
     long zremRangeByScore(String key, double min, double max);
+
+    /**
+     * ZSCORE, or null when the member is absent.
+     *
+     * <p>Load-bearing for the sweep: a wait entry's score IS the evidence for how
+     * long it has already run — the caller's original deadline until the first
+     * renewal replaces it.
+     */
+    Double zscore(String key, String member);
 }

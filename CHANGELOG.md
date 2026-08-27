@@ -24,7 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait-index entry, so with compensation off every call whose reply never
   arrives would leave one behind forever in a structure with no TTL of its own.
   **Compensation is off by default** (`BY_FRAMEWORK_WAIT_SWEEPER_ENABLED`) and is
-  the rollback switch for the whole liveness feature; it is not implemented yet.
+  the rollback switch for the whole liveness feature.
+- Compensation: when a sub-task's reply can never arrive — its worker died, it
+  was never picked up, or it ran past a generous absolute ceiling — the sweep
+  synthesises the reply the callee would have sent, so its caller is resolved
+  instead of hanging. A callee that finished but whose reply was lost has its
+  real stored result recovered and forwarded rather than a failure fabricated.
+  Task Group members are compensated through the group's existing join, never by
+  writing its accounting a second time. Off by default.
 
 ### Changed
 - A Task Group member whose target agent type has no online worker is no longer
