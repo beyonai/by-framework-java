@@ -14,6 +14,7 @@ import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
 import com.iwhaleai.byai.framework.core.protocol.ResumeCommand;
 import com.iwhaleai.byai.framework.core.protocol.ResumeWorkerCommand;
 import com.iwhaleai.byai.framework.core.protocol.SuspendWorkerCommand;
+import com.iwhaleai.byai.framework.core.liveness.WaitGate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import redis.clients.jedis.resps.StreamEntry;
@@ -46,6 +47,7 @@ public class WorkerRunner {
     private final GatewayWorker worker;
     private final RedisClient redisClient;
     private final RedisStreamOps streamOps;
+    private final com.iwhaleai.byai.framework.common.RedisOps redisOps;
     private final String groupName;
     private final String consumerName;
     private final ExecutorService taskExecutor;
@@ -78,6 +80,9 @@ public class WorkerRunner {
         this.streamOps = redisClient.getJedisCluster() != null
                 ? new ClusterRedisStreamOps(redisClient.getJedisCluster())
                 : new StandaloneRedisStreamOps(redisClient);
+        this.redisOps = redisClient.getJedisCluster() != null
+                ? new com.iwhaleai.byai.framework.common.ClusterRedisOps(redisClient.getJedisCluster())
+                : new com.iwhaleai.byai.framework.common.StandaloneRedisOps(redisClient);
         this.groupName = groupName != null ? groupName : autoGroupName();
         this.consumerName = worker.workerId;
         // Use virtual threads for IO-bound task processing (Java 21+)
@@ -367,10 +372,33 @@ public class WorkerRunner {
                     return;
                 }
 
+                boolean isResumeCommand = command instanceof ResumeCommand;
+
+                // 1b. Idempotency gate for replies.
+                //
+                // Placed HERE deliberately: before the execution lookup below, and
+                // before GatewayWorker's Task Group join (which HINCRBYs
+                // `completed`, so a duplicate would push it past `total` and
+                // aggregate a second time). Being upstream of the worker is what
+                // makes one gate cover both.
+                //
+                // Java has a single resume entry point, so unlike Python and TS
+                // this is the only place it needs to live.
+                if (isResumeCommand) {
+                    WaitGate.Decision gate = WaitGate.consumeWaitEntry(redisOps, command);
+                    if (!gate.allow()) {
+                        LOG.warn("[{}] Dropping reply for an already-resolved wait ({}): "
+                                + "message_id={}, child_message_id={}, task_group_id={}, session_id={}",
+                                worker.workerId, gate.reason(), header.messageId(),
+                                header.parentMessageId(), header.taskGroupId(), header.sessionId());
+                        streamOps.xack(streamName, groupName, entry.getID());
+                        return;
+                    }
+                }
+
                 // 2. Business Replay protection (Idempotency)
                 Map<String, Object> existing = worker.registry.getExecutionByMessageId(header.messageId(),
                         header.sessionId());
-                boolean isResumeCommand = command instanceof ResumeCommand;
                 if (existing != null) {
                     String status = String.valueOf(existing.get(Constants.ExecutionFields.STATUS));
                     // A ResumeCommand is exempt: a handler that reached a terminal
