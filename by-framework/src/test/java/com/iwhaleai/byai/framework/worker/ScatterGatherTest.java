@@ -78,7 +78,7 @@ public class ScatterGatherTest {
         when(jedis.hincrBy(groupKey, "completed", 1)).thenReturn(1L); // 1 out of 3
 
         // Act
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Assert
         assert !worker.processCommandCalled;
@@ -102,7 +102,7 @@ public class ScatterGatherTest {
         when(jedis.hincrBy(groupKey, "completed", 1)).thenReturn(3L); // 3 out of 3
 
         // Act
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Assert
         assert worker.processCommandCalled;
@@ -120,7 +120,7 @@ public class ScatterGatherTest {
         ResumeCommand command = ResumeCommand.of(header, "", "SUCCESS", "data", null);
 
         // Act
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Assert
         assert worker.processCommandCalled;

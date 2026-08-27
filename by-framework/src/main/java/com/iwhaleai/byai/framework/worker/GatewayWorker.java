@@ -224,7 +224,20 @@ public abstract class GatewayWorker {
         }
     }
 
-    public void handleMessage(GatewayCommand command, String executionId) {
+    /**
+     * Handle one business message.
+     *
+     * @param existingExecution the execution record this message resolved to, or
+     *        {@code null} when there is none. A resumed execution's caller and its
+     *        original dispatch metadata live here and nowhere else: the waking
+     *        ResumeCommand's own header describes the hop that just finished, not
+     *        the dispatch being answered. Mirrors Python's
+     *        {@code RunningExecution.existing_data}.
+     * @param isResumedExecution whether this execution has already been through a
+     *        worker — a ResumeCommand, or a record whose status is past QUEUED.
+     */
+    public void handleMessage(GatewayCommand command, String executionId,
+            Map<String, Object> existingExecution, boolean isResumedExecution) {
         if (command instanceof CancelTaskCommand cancelCmd) {
             onCancelTask(cancelCmd);
             return;

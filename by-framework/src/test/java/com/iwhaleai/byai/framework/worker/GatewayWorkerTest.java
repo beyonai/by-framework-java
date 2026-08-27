@@ -177,7 +177,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        Thread taskThread = new Thread(() -> worker.handleMessage(command, "exec-1"));
+        Thread taskThread = new Thread(() -> worker.handleMessage(command, "exec-1", null, false));
         taskThread.start();
 
         // Give it a moment to start
@@ -214,7 +214,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCommand);
         assertInstanceOf(AskAgentCommand.class, worker.lastCommand);
@@ -244,7 +244,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastContext);
         assertEquals("sess-1", worker.lastContext.getSessionId());
@@ -268,7 +268,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastContext);
         assertNotNull(worker.lastContext.getTraceId());
@@ -291,7 +291,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCommand);
         assertInstanceOf(ResumeCommand.class, worker.lastCommand);
@@ -314,7 +314,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
@@ -339,7 +339,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
         verify(jedis, atLeastOnce()).xadd(anyString(), any(XAddParams.class), fieldsCaptor.capture());
@@ -365,7 +365,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Should enqueue callback to caller-agent's ctrl stream
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
@@ -395,7 +395,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
@@ -443,7 +443,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         String callerStream = Constants.QueueNames.ctrlStream("caller-agent");
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
@@ -469,7 +469,7 @@ class GatewayWorkerTest {
                         .build())
                 .build();
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         assertNotNull(worker.lastCancelCommand);
         assertEquals("target-msg-1", worker.lastCancelCommand.targetMessageId());
@@ -489,7 +489,7 @@ class GatewayWorkerTest {
                         .build())
                 .build();
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // processCommand should not be called for cancel commands
         assertNull(worker.lastCommand);
@@ -512,7 +512,7 @@ class GatewayWorkerTest {
                 null
         );
 
-        worker.handleMessage(command, "exec-test-id");
+        worker.handleMessage(command, "exec-test-id", null, false);
 
         // Should emit COMPLETED, not QUEUED
         ArgumentCaptor<Map<String, String>> fieldsCaptor = ArgumentCaptor.forClass(Map.class);
