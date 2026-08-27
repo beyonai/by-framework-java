@@ -176,6 +176,36 @@ Agent 一旦挂起（`askUser`，或 `waitForReply` 的 `callAgent`）就会结�
 
 ---
 
+### 挂起调用方的存活判定
+
+用 `waitForReply` 派发的调用方会**结束本次执行**，之后由一条 `ResumeCommand`
+重新拉起。它没有存活的协程，所以内部无法给自己超时 —— 子 worker 猝死、挂死、
+回调丢失时，调用方会永远等下去。边界来自外部：分片的等待索引加一个后台扫描，
+两者都随 worker 启动。
+
+`callAgent` 新增可选的 `replyTimeoutMs`（默认 1 小时）；`askUser` 用会话 TTL。
+挂起的调用方落库为 `WAITING_AGENT` 或 `WAITING_USER`，因此 `QUEUED` 现在只表示
+"尚未被捡起"。
+
+两个独立开关：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `BY_FRAMEWORK_WAIT_PRUNE_ENABLED` | **开** | 删除老到不可能再审讯成功的等待条目。它不做任何决策，所以无需 opt-in —— 而且除了它之外没有任何东西会移除条目，不开就会每个未回复的调用泄漏一条 |
+| `BY_FRAMEWORK_WAIT_SWEEPER_ENABLED` | **关** | 补偿：合成一条已死 callee 本该发出的回复。这是整个特性的回滚开关 |
+| `BY_FRAMEWORK_WAIT_CANCEL_ON_TIMEOUT` | 开 | 在调用方已被解决之后，额外请求超时的 callee 停止 |
+
+开启补偿后，以下情形调用方会被解决：callee 的 worker 猝死
+（`CHILD_WORKER_LOST`）、从未被捡起（`CHILD_NEVER_STARTED`）、
+或超过一个宽松的绝对上限（`CHILD_TIMEOUT`）。
+若 callee 其实已完成、只是回复丢了，会取回并转发它**真实**的已存结果
+（`REPLY_LOST_RECOVERED`），而不是给一个实际成功的任务编造失败。
+
+索引、member 编码与分片函数是**跨 SDK 契约**：Python、TypeScript 与 Java
+读写同一批结构，所以 Python worker 的扫描已经能补偿 Java 登记的等待，反之亦然。
+
+---
+
 ## 📡 发送任务
 
 ```java

@@ -175,6 +175,39 @@ will never be resumed, so it replies immediately.
 
 ---
 
+### Bounding a suspended caller
+
+A caller that dispatches with `waitForReply` **ends its execution** and is
+revived later by a `ResumeCommand`. It has no live coroutine, so nothing inside
+it can time it out — if the sub-worker dies, hangs, or its callback is lost, the
+caller waits forever. The bound comes from outside: a sharded wait index plus a
+background sweep, both started with the worker.
+
+`callAgent` accepts an optional `replyTimeoutMs` (default 1 hour); `askUser`
+uses the session TTL. A suspended caller is recorded as `WAITING_AGENT` or
+`WAITING_USER`, which is why `QUEUED` now means only "not yet picked up".
+
+Two independent switches:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `BY_FRAMEWORK_WAIT_PRUNE_ENABLED` | **on** | Deletes wait entries old enough that no interrogation could succeed. Decides nothing, so it needs no opt-in — and nothing else ever removes an entry, so without it every unanswered call leaks one. |
+| `BY_FRAMEWORK_WAIT_SWEEPER_ENABLED` | **off** | Compensation: synthesises the reply a dead callee would have sent. This is the rollback switch for the whole feature. |
+| `BY_FRAMEWORK_WAIT_CANCEL_ON_TIMEOUT` | on | Also asks a timed-out callee to stop, after its caller has already been resolved. |
+
+With compensation on, a caller is resolved when its callee's worker died
+(`CHILD_WORKER_LOST`), it was never picked up (`CHILD_NEVER_STARTED`), or it ran
+past a generous absolute ceiling (`CHILD_TIMEOUT`). A callee that finished but
+whose reply was lost has its **real** stored result recovered and forwarded
+(`REPLY_LOST_RECOVERED`) rather than a failure fabricated for work that actually
+succeeded.
+
+The index, the member encoding and the shard function are a cross-SDK contract:
+Python, TypeScript and Java read and write the same structures, so a Python
+worker's sweep already compensates waits registered by Java and vice versa.
+
+---
+
 ## 📡 Sending Tasks
 
 ```java
