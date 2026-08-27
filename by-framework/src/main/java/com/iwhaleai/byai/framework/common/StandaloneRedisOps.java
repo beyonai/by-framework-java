@@ -230,6 +230,27 @@ public class StandaloneRedisOps implements RedisOps {
     }
 
     @Override
+    public long zrem(String key, String member) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.zrem(key, member);
+        }
+    }
+
+    @Override
+    public List<String> zrangeByScore(String key, double min, double max, int limit) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return new ArrayList<>(jedis.zrangeByScore(key, min, max, 0, limit));
+        }
+    }
+
+    @Override
+    public long zremRangeByScore(String key, double min, double max) {
+        try (Jedis jedis = redisClient.getResource()) {
+            return jedis.zremrangeByScore(key, min, max);
+        }
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         List<String> result = new ArrayList<>();
         ScanParams params = new ScanParams().match(pattern).count(100);

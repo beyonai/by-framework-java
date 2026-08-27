@@ -192,6 +192,21 @@ public class ClusterRedisOps implements RedisOps {
     }
 
     @Override
+    public long zrem(String key, String member) {
+        return jedisCluster.zrem(key, member);
+    }
+
+    @Override
+    public List<String> zrangeByScore(String key, double min, double max, int limit) {
+        return new ArrayList<>(jedisCluster.zrangeByScore(key, min, max, 0, limit));
+    }
+
+    @Override
+    public long zremRangeByScore(String key, double min, double max) {
+        return jedisCluster.zremrangeByScore(key, min, max);
+    }
+
+    @Override
     public List<String> scanKeys(String pattern, int limit) {
         Set<String> result = new LinkedHashSet<>();
         ScanParams params = new ScanParams().match(pattern).count(100);

@@ -119,4 +119,20 @@ public interface RedisOps {
 
     /** ZADD one member at a score, returning the number of new members added. */
     long zadd(String key, double score, String member);
+
+    /**
+     * ZREM one member, returning the number of members actually removed.
+     *
+     * <p>The return value is load-bearing for the wait-index gate: 1 means this
+     * caller claimed the entry, 0 means either somebody else already claimed it
+     * or it was never registered. Those two are NOT the same and the caller must
+     * distinguish them — see the gate's consumed-marker lookup.
+     */
+    long zrem(String key, String member);
+
+    /** ZRANGEBYSCORE, ascending, bounded by {@code limit} members. */
+    List<String> zrangeByScore(String key, double min, double max, int limit);
+
+    /** ZREMRANGEBYSCORE, returning the number of members removed. */
+    long zremRangeByScore(String key, double min, double max);
 }
