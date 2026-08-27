@@ -105,6 +105,14 @@ public class Constants {
 public static final String MESSAGE_ID_PREFIX = "msg-";
 public static final String EXECUTION_ID_PREFIX = "exec-";
 public static final String TASK_GROUP_ID_PREFIX = "tg-";
+
+/**
+ * A single call_agent reuses the Task Group result storage as a group of one, so
+ * recovery has a single code path. Cross-SDK contract: the prefix is exactly
+ * "tg-single-" and the group id is this prefix concatenated with the CHILD's
+ * message id.
+ */
+public static final String TASK_GROUP_SINGLE_ID_PREFIX = "tg-single-";
 public static final String CANCEL_MESSAGE_ID_PREFIX = "msg-cancel-";
 
 /**
@@ -127,6 +135,57 @@ public static final String TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type";
 // 时间常量
 public static final int WAIT_FOR_TASKS_TIMEOUT_SECONDS = 5;
 public static final int TASK_GROUP_TTL_SECONDS = 86400;
+
+// --- Suspended-caller liveness (cross-SDK contract section 6) -------------
+// Every value here is replicated verbatim in the Python and TS SDKs. Changing
+// one in isolation makes cross-language chains fail silently, because the two
+// sides compute different keys or members and the gate never matches.
+
+/** Number of wait-index shards. Feeds fnv1a32(session_id) % SHARDS. */
+public static final int WAIT_INDEX_SHARDS = 16;
+
+/** Default bound on a call_agent(waitForReply=true) reply: 1 hour. */
+public static final long DEFAULT_REPLY_TIMEOUT_MS = 3_600_000L;
+
+/** Default bound on an askUser answer: the session TTL, i.e. 7 days. */
+public static final long DEFAULT_ASK_USER_TIMEOUT_MS = DEFAULT_SESSION_TTL * 1000L;
+
+/**
+ * TTL of the "this entry was already resolved" marker.
+ *
+ * MUST be at least as long as the askUser deadline: the gate reads this marker
+ * to tell "already claimed" from "never registered", and if it expires while an
+ * askUser wait is still alive, a duplicate sub-agent reply can clear that wait.
+ */
+public static final int WAIT_CONSUMED_TTL_SECONDS = DEFAULT_SESSION_TTL;
+
+/** Prune entries older than this. MUST be strictly greater than the session TTL. */
+public static final int WAIT_PRUNE_AFTER_SECONDS = DEFAULT_SESSION_TTL + 86400;
+
+/** How much a sweep extends a still-live wait. */
+public static final long WAIT_RENEW_INCREMENT_MS = 300_000L;
+
+/** Ceiling on renewals, as a multiple of the original timeout budget. */
+public static final int WAIT_RENEW_MAX_MULTIPLE = 3;
+
+public static final int WAIT_SWEEP_INTERVAL_SECONDS = 30;
+public static final int WAIT_PRUNE_INTERVAL_SECONDS = 3600;
+public static final int WAIT_SWEEP_LOCK_TTL_SECONDS = 60;
+public static final int WAIT_SWEEP_BATCH_LIMIT = 200;
+
+/**
+ * Liveness error codes. APPEND ONLY — never rename one; they cross SDK and
+ * version boundaries on the wire (contract section 8).
+ */
+public static final class LivenessErrorCode {
+    public static final String CHILD_WORKER_LOST = "CHILD_WORKER_LOST";
+    public static final String CHILD_TIMEOUT = "CHILD_TIMEOUT";
+    public static final String CHILD_NEVER_STARTED = "CHILD_NEVER_STARTED";
+    public static final String REPLY_LOST_RECOVERED = "REPLY_LOST_RECOVERED";
+
+    private LivenessErrorCode() {
+    }
+}
 public static final int FIRST_RETRY_WAIT_SECONDS = 1;
 public static final int MAX_RETRY_COUNT = 3;
     public static final int WORKER_LOCK_TTL_SECONDS = 60;
@@ -321,6 +380,49 @@ public static final int MAX_RETRY_COUNT = 3;
             return versioned(
                     REDIS_PREFIX + "task_group:" + groupId + ":results",
                     "task_group:{" + groupId + "}:results");
+        }
+
+        // --- 挂起调用方存活判定 (contract section 1) ---
+        // Sharding deliberately spans entities, so wait_index and wait_sweep_lock
+        // carry NO hash tag: they are meant to spread across slots. A consequence
+        // is that a sweep cannot do multi-key atomic work across shards — each
+        // shard is claimed and scanned independently.
+
+        /** ZSET of suspended callers for one shard. Member: contract section 2; score: deadline(ms). */
+        public static String waitIndex(int shard) {
+            return versioned(REDIS_PREFIX + "wait_index:" + shard, "wait_index:" + shard);
+        }
+
+        /** Short-lived claim taken while sweeping one shard. */
+        public static String waitSweepLock(int shard) {
+            return versioned(REDIS_PREFIX + "wait_sweep_lock:" + shard, "wait_sweep_lock:" + shard);
+        }
+
+        /**
+         * Marker that an entry was already resolved, tagged by session.
+         *
+         * Read when ZREM returns 0, to tell "already claimed" (drop) from "never
+         * registered" (let through). Conflating those loses a message on every
+         * rolling upgrade.
+         */
+        public static String waitConsumed(String sessionId, String memberDigest) {
+            return versioned(
+                    REDIS_PREFIX + String.format("wait_consumed:%s:%s", sessionId, memberDigest),
+                    String.format("wait_consumed:{%s}:%s", sessionId, memberDigest));
+        }
+
+        /**
+         * The deadline a renewal budget is measured from. Written ONLY by a sweep,
+         * and only on the first renewal.
+         *
+         * It lives in a side key rather than in the member because every member
+         * field has to be derivable from a ResumeCommand alone — that is what lets
+         * the gate run without an extra lookup.
+         */
+        public static String waitRenewOrigin(String sessionId, String memberDigest) {
+            return versioned(
+                    REDIS_PREFIX + String.format("wait_renew_origin:%s:%s", sessionId, memberDigest),
+                    String.format("wait_renew_origin:{%s}:%s", sessionId, memberDigest));
         }
 
         // --- 服务发现 (Service Discovery) ---

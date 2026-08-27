@@ -22,6 +22,7 @@ import com.iwhaleai.byai.framework.core.protocol.DataMessage;
 import com.iwhaleai.byai.framework.core.protocol.EventType;
 import com.iwhaleai.byai.framework.core.protocol.MessageHeader;
 import com.iwhaleai.byai.framework.core.WorkerRegistry;
+import com.iwhaleai.byai.framework.core.liveness.WaitRegistration;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.HashMap;
@@ -290,6 +291,12 @@ public class AgentContext {
             String formJson = objectMapper.writeValueAsString(inputForm);
             Map<String, Object> data = buildSseLayout(formJson, "assistant", CONTENT_TYPE_USER_INPUT);
             emitEvent(EventType.REASONING_LOG_DELTA.getValue(), data, prompt, "", metadata);
+            // childMessageId is "" for an askUser wait: the answer comes from a
+            // client whose header.parentMessageId is arbitrary, so the member
+            // cannot be derived from it. The gate recovers this entry through its
+            // second candidate instead (contract section 4).
+            WaitRegistration.register(redisOps, sessionId, currentMessageId, "", "",
+                    Constants.DEFAULT_ASK_USER_TIMEOUT_MS);
             markSuspended(AgentState.WAITING_USER);
             return Map.of(Constants.RedisFields.STATUS, AgentState.WAITING_USER);
         } catch (JsonProcessingException e) {
@@ -329,6 +336,19 @@ public class AgentContext {
     public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
             Map<String, Object> metadata, String taskGroupId, String routePolicy, long availabilityTimeoutMs,
             String region, String priority) {
+        return callAgent(targetAgentType, content, payload, waitForReply, metadata, taskGroupId,
+                routePolicy, availabilityTimeoutMs, region, priority, 0L);
+    }
+
+    /**
+     * @param replyTimeoutMs bounds how long the caller may stay suspended on this
+     *        reply. Only meaningful with {@code waitForReply}; 0 means the default
+     *        (1 hour). The bound is enforced from OUTSIDE the caller — it ends its
+     *        execution when it dispatches, so nothing inside it can time out.
+     */
+    public Map<String, Object> callAgent(String targetAgentType, String content, Map<String, Object> payload, boolean waitForReply,
+            Map<String, Object> metadata, String taskGroupId, String routePolicy, long availabilityTimeoutMs,
+            String region, String priority, long replyTimeoutMs) {
 
         String msgId = Constants.MESSAGE_ID_PREFIX + UUID.randomUUID().toString().substring(0, 8);
         String executionId = Constants.EXECUTION_ID_PREFIX + UUID.randomUUID().toString().substring(0, Constants.ID_SHORT_SUFFIX_LENGTH);
@@ -448,6 +468,15 @@ public class AgentContext {
             log.warn("Failed to initialize execution tracking for callAgent: {}", e.getMessage());
         }
 
+        // Registered next to initializeExecution, i.e. right after the dispatch is
+        // committed. The window that must not exist is "dispatched but nobody
+        // knows we are waiting".
+        if (waitForReply) {
+            WaitRegistration.register(redisOps, sessionId, currentMessageId, msgId,
+                    taskGroupId != null ? taskGroupId : "",
+                    replyTimeoutMs > 0 ? replyTimeoutMs : Constants.DEFAULT_REPLY_TIMEOUT_MS);
+        }
+
         Map<String, Object> response = new HashMap<>();
         response.put(Constants.RedisFields.STATUS, AvailabilityStatus.WAIT_AND_DELIVER.equals(availResult.getStatus())
                 ? AvailabilityStatus.WAIT_AND_DELIVER : AgentState.QUEUED);
@@ -527,7 +556,16 @@ public class AgentContext {
 
                 // Initialize execution tracking for each dispatched task
                 try {
-                    workerRegistry.initializeExecution(execId, msgId, sessionId, targetAgentType, currentMessageId);
+                    // Same three fields the single-call path records. A group
+                    // member suspending is normal — it may call another agent or
+                    // askUser itself — and without these it cannot recover its
+                    // caller or its dispatch metadata when it resumes.
+                    Map<String, Object> memberFields = new HashMap<>();
+                    memberFields.put("source_agent_type", waitForReply ? currentAgentType : "");
+                    memberFields.put("task_group_id", groupId);
+                    memberFields.put("metadata", new HashMap<>(metadata));
+                    workerRegistry.initializeExecution(execId, msgId, sessionId, targetAgentType,
+                            currentMessageId, traceId, memberFields);
                 } catch (Exception ex) {
                     log.warn("Failed to initialize execution tracking for group dispatch: {}", ex.getMessage());
                 }
