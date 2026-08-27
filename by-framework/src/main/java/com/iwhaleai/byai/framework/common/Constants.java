@@ -107,6 +107,18 @@ public static final String EXECUTION_ID_PREFIX = "exec-";
 public static final String TASK_GROUP_ID_PREFIX = "tg-";
 public static final String CANCEL_MESSAGE_ID_PREFIX = "msg-cancel-";
 
+/**
+ * Sentinel a GatewayClient writes as an execution record's source_agent_type
+ * for a dispatch it made itself. It is NOT an agent type: nothing declares it,
+ * so nothing consumes its control stream.
+ *
+ * Load-bearing wherever a resumed execution recovers its caller from its own
+ * record — treating it as a real caller posts the result to a stream nobody
+ * reads AND suppresses the end-of-stream event the front end waits on.
+ * Same literal in all three SDKs; do not spell it inline.
+ */
+public static final String CLIENT_SOURCE_AGENT_TYPE = "client";
+
 // 任务组 Hash 字段
 public static final String TASK_GROUP_FIELD_TOTAL = "total";
 public static final String TASK_GROUP_FIELD_COMPLETED = "completed";

@@ -51,6 +51,37 @@ public class AgentContext {
     private static final String CONTENT_TYPE_USER_INPUT = "3013";
     private boolean streamFinished = false;
 
+    /**
+     * Whether this execution suspended — it dispatched to another agent, or asked
+     * a person, and its result is not in yet.
+     *
+     * The framework decides this, not the business handler: AgentContext is what
+     * suspended, whereas a handler is free to return anything (the in-tree ones
+     * return plain QUEUED, indistinguishable from "still queued behind a worker").
+     * GatewayWorker reads it to decide that a suspended execution owes its caller
+     * nothing YET — forwarding the value a handler returned merely to unwind
+     * would wake the caller early with a placeholder and burn the single reply it
+     * is parked on.
+     */
+    private boolean suspended = false;
+
+    /** Which suspended state this is: "" / WAITING_AGENT / WAITING_USER. */
+    private String suspendedState = "";
+
+    public boolean isSuspended() {
+        return suspended;
+    }
+
+    public String suspendedState() {
+        return suspendedState;
+    }
+
+    /** Package-private: the framework sets this, and same-package tests drive it. */
+    void markSuspended(String state) {
+        this.suspended = true;
+        this.suspendedState = state;
+    }
+
     public AgentContext(String sessionId, String traceId, RedisClient redisClient, String currentAgentType,
             String currentMessageId) {
         this.sessionId = sessionId;
@@ -259,6 +290,7 @@ public class AgentContext {
             String formJson = objectMapper.writeValueAsString(inputForm);
             Map<String, Object> data = buildSseLayout(formJson, "assistant", CONTENT_TYPE_USER_INPUT);
             emitEvent(EventType.REASONING_LOG_DELTA.getValue(), data, prompt, "", metadata);
+            markSuspended(AgentState.WAITING_USER);
             return Map.of(Constants.RedisFields.STATUS, AgentState.WAITING_USER);
         } catch (JsonProcessingException e) {
             throw new RuntimeException("Failed to serialize askUser form", e);
@@ -330,6 +362,23 @@ public class AgentContext {
             errorResponse.put("error", availResult.getReason());
             errorResponse.put("error_code", availResult.getErrorCode() != null ? availResult.getErrorCode() : "ERR_AGENT_TYPE_UNAVAILABLE");
             return errorResponse;
+        }
+
+        // Suspend here, deliberately AFTER the REJECT early-return above and
+        // BEFORE the QUEUE_PENDING one below.
+        //
+        // After REJECT: nothing was dispatched, so nothing will ever reply — a
+        // context left looking suspended would make its handler owe a reply that
+        // never comes. Python needs an explicit rollback for this because it
+        // suspends before the availability check; Java's ordering makes the
+        // rollback structurally unnecessary, so do NOT port that patch.
+        //
+        // Before QUEUE_PENDING: the router has stored the delivery and will make
+        // it later, so the caller IS waiting on a reply. Same as Python, which
+        // keeps _is_suspended set for QUEUE_PENDING and only skips the immediate
+        // control-stream write.
+        if (waitForReply) {
+            markSuspended(AgentState.WAITING_AGENT);
         }
 
         // Handle QUEUE_PENDING: router has stored the pending delivery, skip dispatch

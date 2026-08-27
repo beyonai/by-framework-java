@@ -4,6 +4,13 @@ public class AgentState {
     public static final String STARTING = "STARTING";
     public static final String RUNNING = "RUNNING";
     public static final String WAITING_USER = "WAITING_USER";
+    /**
+     * A caller suspended on another agent's reply. Distinct from WAITING_USER
+     * (suspended on a person) and from QUEUED, which must stay the only status
+     * an execution can hold before its FIRST pickup — WorkerRunner infers
+     * "already been through a worker" from status != QUEUED.
+     */
+    public static final String WAITING_AGENT = "WAITING_AGENT";
     public static final String CALLING_AGENT = "CALLING_AGENT";
     public static final String COMPLETED = "COMPLETED";
     public static final String FAILED = "FAILED";
