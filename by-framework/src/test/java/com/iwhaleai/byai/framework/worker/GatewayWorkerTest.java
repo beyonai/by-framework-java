@@ -49,6 +49,11 @@ class GatewayWorkerTest {
             super(workerId, redisClient);
         }
 
+        EchoWorker(String workerId, RedisClient redisClient,
+                com.iwhaleai.byai.framework.core.WorkerRegistry registry) {
+            super(workerId, redisClient, registry);
+        }
+
         @Override
         public List<String> getAgentTypes() {
             return List.of("echo-agent");
@@ -535,8 +540,9 @@ class GatewayWorkerTest {
 
     /** Suspends the way callAgent(waitForReply=true) does, then unwinds. */
     private static class SuspendingWorker extends GatewayWorker {
-        SuspendingWorker(String workerId, RedisClient redisClient) {
-            super(workerId, redisClient);
+        SuspendingWorker(String workerId, RedisClient redisClient,
+                com.iwhaleai.byai.framework.core.WorkerRegistry registry) {
+            super(workerId, redisClient, registry);
         }
 
         @Override
@@ -553,8 +559,9 @@ class GatewayWorkerTest {
 
     /** Dispatches, then reaches a terminal state anyway — it owes a reply now. */
     private static class SuspendingThenDoneWorker extends GatewayWorker {
-        SuspendingThenDoneWorker(String workerId, RedisClient redisClient) {
-            super(workerId, redisClient);
+        SuspendingThenDoneWorker(String workerId, RedisClient redisClient,
+                com.iwhaleai.byai.framework.core.WorkerRegistry registry) {
+            super(workerId, redisClient, registry);
         }
 
         @Override
@@ -648,7 +655,7 @@ class GatewayWorkerTest {
     void aSuspendedExecutionDoesNotReplyYet() {
         // The value a handler returns merely to unwind is not a result. Sending
         // it wakes the caller early and burns the single reply it is parked on.
-        SuspendingWorker worker = new SuspendingWorker("worker-1", redisClient);
+        SuspendingWorker worker = new SuspendingWorker("worker-1", redisClient, registry);
         AskAgentCommand dispatch = AskAgentCommand.of(
                 MessageHeader.builder()
                         .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
@@ -668,7 +675,7 @@ class GatewayWorkerTest {
     void aTerminalStatusOverridesSuspensionAndRepliesNow() {
         // It dispatched, then finished anyway: no resume is coming, so this is
         // the caller's only chance to hear anything.
-        SuspendingThenDoneWorker worker = new SuspendingThenDoneWorker("worker-1", redisClient);
+        SuspendingThenDoneWorker worker = new SuspendingThenDoneWorker("worker-1", redisClient, registry);
         AskAgentCommand dispatch = AskAgentCommand.of(
                 MessageHeader.builder()
                         .messageId("msg-b").sessionId("sess-1").traceId("trace-1")
@@ -829,5 +836,59 @@ class GatewayWorkerTest {
                 "group results must be keyed by the sub-task's own message id");
         assertFalse(field.getAllValues().contains("msg-caller"),
                 "keying by the caller's id makes siblings overwrite each other");
+    }
+
+    // ---- E2: WAITING_* is persisted by the framework -----------------------
+
+    @Test
+    void aSuspendedExecutionIsPersistedAsWaiting() {
+        // Every in-tree handler returns plain QUEUED after dispatching, which is
+        // indistinguishable from "still queued behind a worker" once written. The
+        // context is what knows it suspended, so the framework overrides.
+        SuspendingWorker worker = new SuspendingWorker("worker-1", redisClient, registry);
+        AskAgentCommand dispatch = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .sourceAgentType("agent-a").targetAgentType("echo-agent")
+                        .parentMessageId("msg-a").build(),
+                "delegate", false, null);
+
+        worker.handleMessage(dispatch, "exec-b", null, false);
+
+        verify(registry).markExecutionFinished(
+                eq("exec-b"), eq("sess-1"), eq(AgentState.WAITING_AGENT));
+    }
+
+    @Test
+    void aTerminalStatusIsPersistedEvenAfterDispatching() {
+        // It dispatched and then finished anyway: it is done, whatever it
+        // dispatched, and will never be resumed.
+        SuspendingThenDoneWorker worker = new SuspendingThenDoneWorker("worker-1", redisClient, registry);
+        AskAgentCommand dispatch = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-b").sessionId("sess-1").traceId("t-1")
+                        .sourceAgentType("agent-a").targetAgentType("echo-agent")
+                        .parentMessageId("msg-a").build(),
+                "delegate", false, null);
+
+        worker.handleMessage(dispatch, "exec-b", null, false);
+
+        verify(registry).markExecutionFinished(
+                eq("exec-b"), eq("sess-1"), eq(AgentState.COMPLETED));
+    }
+
+    @Test
+    void anUnsuspendedExecutionKeepsTheHandlersStatus() {
+        EchoWorker worker = new EchoWorker("worker-1", redisClient, registry);
+        AskAgentCommand dispatch = AskAgentCommand.of(
+                MessageHeader.builder()
+                        .messageId("msg-1").sessionId("sess-1").traceId("t-1")
+                        .targetAgentType("echo-agent").build(),
+                "hello", false, null);
+
+        worker.handleMessage(dispatch, "exec-1", null, false);
+
+        verify(registry, never()).markExecutionFinished(
+                anyString(), anyString(), eq(AgentState.WAITING_AGENT));
     }
 }

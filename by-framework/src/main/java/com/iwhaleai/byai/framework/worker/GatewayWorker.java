@@ -328,7 +328,20 @@ public abstract class GatewayWorker {
                 }
             }
 
-            registry.markExecutionFinished(executionId, header.sessionId(), finalStatus);
+            // The framework decides a suspended execution's persisted status, not
+            // the handler: AgentContext is what suspended, whereas every in-tree
+            // handler returns plain QUEUED — indistinguishable from "still queued
+            // behind a worker" once written. QUEUED must stay the ONLY status an
+            // execution can hold before its first pickup, because WorkerRunner
+            // infers "already been through a worker" from status != QUEUED.
+            //
+            // A terminal status wins: a handler that reached COMPLETED/FAILED/
+            // CANCELLED after dispatching is finished, whatever it dispatched.
+            String persistedStatus = finalStatus;
+            if (!context.suspendedState().isEmpty() && !AgentState.isTerminalState(finalStatus)) {
+                persistedStatus = context.suspendedState();
+            }
+            registry.markExecutionFinished(executionId, header.sessionId(), persistedStatus);
             pluginRegistry.onTaskComplete(context, result);
         } catch (Exception e) {
             boolean isCancelled = e instanceof InterruptedException ||
