@@ -152,6 +152,28 @@ public class MyAssistant extends GatewayWorker {
 }
 ```
 
+### 挂起前后的 `header.metadata`
+
+Agent 一旦挂起（`askUser`，或 `waitForReply` 的 `callAgent`）就会结束本次执行，
+之后由一条 `ResumeCommand` 重新拉起。metadata 在两个方向上被还原，
+规则是**刻意不同**的：
+
+- **你的 handler 读到的**（恢复后那次调用的 `command.header().metadata()`）：
+  本次执行**最初被派发时**携带的 metadata，与唤醒消息自身的 metadata 合并，
+  同名键以唤醒消息为准（它是更新、更具体的那一跳）。
+  没有这层还原的话，你被派发时收到的一切会在第一次挂起时全部消失。
+- **你的调用方收到的**：**它**派发你时带的那份 metadata，整体替换，
+  再叠加你在返回值 `metadata` 里给出的内容。唤醒你的那条消息只是那一跳的
+  管道数据，永远不会流到你的调用方——尽管你自己看得到它。
+
+三个框架注入的键 —— `trace_parent_span_id`、`framework_parent_span_id`、
+`langfuse_parent_observation_id` —— 始终描述当前这一跳，不会从记录里还原。
+
+挂起中的执行**不会**立刻回复调用方：handler 为了 unwind 而返回的值不是结果，
+发出去会把调用方提前唤醒，并烧掉它唯一在等的那条回复。真正的结果在执行恢复并
+完成时才发出。例外是终态——handler 在派发后到达 COMPLETED/FAILED/CANCELLED
+说明它真的完成了、不会再被 resume，此时必须立即回复。
+
 ---
 
 ## 📡 发送任务
