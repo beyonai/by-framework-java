@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than whatever the handler returned while unwinding. Visible on the execution
   record and in the dashboard; `QUEUED` now means only "not yet picked up".
 
+### Changed
+- A Task Group member whose target agent type has no online worker is no longer
+  dispatched. It previously went out blind, so that member never replied and the
+  group never completed, hanging the caller. A stand-in `FAILED` reply is queued
+  for it instead and flushed after the handler returns, so the group's existing
+  join accounting sees exactly one result per member. Matches the Python and
+  TypeScript SDKs.
+- A duplicate reply for an already-resolved wait is now dropped rather than
+  waking the caller twice. Only reachable once something can synthesise a reply,
+  so this is inert today; a reply whose wait was never registered is still let
+  through, which is what keeps rolling upgrades safe.
+
 ### Fixed
 - Task Group results were keyed by the caller's message id, so every sibling in
   a group wrote the same field and overwrote each other — the join then read one
