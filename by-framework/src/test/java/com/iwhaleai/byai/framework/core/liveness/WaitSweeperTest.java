@@ -395,7 +395,7 @@ class WaitSweeperTest {
 
         ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
         verify(redisOps, atLeastOnce()).set(keys.capture(), anyString(), any(SetParams.class));
-        assertTrue(keys.getAllValues().stream().anyMatch(k -> k.contains("wait_renew_origin")),
+        assertTrue(keys.getAllValues().stream().anyMatch(k -> k.contains("wait:renew_origin")),
                 "the first renewal must save the original deadline");
     }
 }

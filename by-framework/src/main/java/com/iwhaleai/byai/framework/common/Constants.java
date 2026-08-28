@@ -390,12 +390,12 @@ public static final int MAX_RETRY_COUNT = 3;
 
         /** ZSET of suspended callers for one shard. Member: contract section 2; score: deadline(ms). */
         public static String waitIndex(int shard) {
-            return versioned(REDIS_PREFIX + "wait_index:" + shard, "wait_index:" + shard);
+            return versioned(REDIS_PREFIX + "wait:index:" + shard, "wait:index:" + shard);
         }
 
         /** Short-lived claim taken while sweeping one shard. */
         public static String waitSweepLock(int shard) {
-            return versioned(REDIS_PREFIX + "wait_sweep_lock:" + shard, "wait_sweep_lock:" + shard);
+            return versioned(REDIS_PREFIX + "wait:sweep_lock:" + shard, "wait:sweep_lock:" + shard);
         }
 
         /**
@@ -407,8 +407,8 @@ public static final int MAX_RETRY_COUNT = 3;
          */
         public static String waitConsumed(String sessionId, String memberDigest) {
             return versioned(
-                    REDIS_PREFIX + String.format("wait_consumed:%s:%s", sessionId, memberDigest),
-                    String.format("wait_consumed:{%s}:%s", sessionId, memberDigest));
+                    REDIS_PREFIX + String.format("wait:consumed:%s:%s", sessionId, memberDigest),
+                    String.format("wait:consumed:{%s}:%s", sessionId, memberDigest));
         }
 
         /**
@@ -421,8 +421,8 @@ public static final int MAX_RETRY_COUNT = 3;
          */
         public static String waitRenewOrigin(String sessionId, String memberDigest) {
             return versioned(
-                    REDIS_PREFIX + String.format("wait_renew_origin:%s:%s", sessionId, memberDigest),
-                    String.format("wait_renew_origin:{%s}:%s", sessionId, memberDigest));
+                    REDIS_PREFIX + String.format("wait:renew_origin:%s:%s", sessionId, memberDigest),
+                    String.format("wait:renew_origin:{%s}:%s", sessionId, memberDigest));
         }
 
         // --- 服务发现 (Service Discovery) ---
