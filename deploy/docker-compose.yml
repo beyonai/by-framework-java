@@ -1,0 +1,31 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No HTTP readiness endpoint yet - this just checks the exec:java-run
+    # DemoWorker process is still alive. deploy-smoke-test.yml's
+    # SendAndVerifyExample compensates with its own read-with-retry loop
+    # against the data stream, so a worker that's up but still registering
+    # membership doesn't fail the smoke test.
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q DemoWorker || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
