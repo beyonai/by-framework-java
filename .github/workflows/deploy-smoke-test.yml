@@ -1,0 +1,69 @@
+name: Deploy Smoke Test
+
+# Validates deploy/'s Dockerfile + docker-compose.yml actually deliver a
+# message through the full pipeline - client sends -> Redis control stream
+# -> Worker consumes -> Worker replies -> Redis data stream -> client reads
+# - using examples/DemoWorker (built into the worker container from THIS
+# commit's source, not the last published release) and
+# examples/SendAndVerifyExample (run on the host runner against the same
+# Redis, published on localhost:6379 by docker-compose). Mirrors
+# by-framework-ts's .github/workflows/deploy-smoke-test.yml.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "by-framework/src/**"
+      - "by-framework/pom.xml"
+      - "pom.xml"
+      - "config/**"
+      - ".github/workflows/deploy-smoke-test.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy/**"
+      - "by-framework/src/**"
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    env:
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      # GatewayConfig falls back to the myuser/mypassword placeholder baked
+      # into gateway-config.properties whenever these aren't set - override
+      # both to empty so the unauthenticated Redis service below actually
+      # connects instead of failing with WRONGPASS.
+      REDIS_USERNAME: ""
+      REDIS_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Compile (for the SendAndVerifyExample driver below)
+        run: mvn -B -q -pl by-framework -am compile
+
+      - name: Build and start Redis + Worker via deploy/docker-compose.yml
+        run: docker compose -f deploy/docker-compose.yml up --build -d --wait --wait-timeout 90
+
+      - name: Send a message and verify the Worker echoes it back
+        run: |
+          cd by-framework
+          mvn -B -q org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
+            -Dexec.mainClass=com.iwhaleai.byai.framework.examples.SendAndVerifyExample \
+            -Dexec.classpathScope=compile
+
+      - name: Worker logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml logs worker
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v
