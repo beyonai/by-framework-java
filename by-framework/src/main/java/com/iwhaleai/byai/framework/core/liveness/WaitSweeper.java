@@ -44,14 +44,16 @@ import redis.clients.jedis.params.SetParams;
  *       on is a behaviour change.
  * </ul>
  *
- * <p>This class currently implements the loop and the pruning half.
- * Compensation — triage, synthesised replies, renewal ceiling, group orphans,
- * timeout cancellation — is the next stage; {@link #compensateEnabled} is
- * already read so the switch exists from the start.
+ * <p>Compensation triages a due entry against evidence that already exists —
+ * the caller's record, the callee's record, and the callee's worker lease — and
+ * synthesises the reply the callee would have sent when one can never arrive.
+ * Ordering there is deliberate: everything establishing that somebody is still
+ * waiting is checked before anything that could produce a reply, because a reply
+ * nobody is waiting for re-enters a finished execution.
  *
- * <p>Per the cross-SDK contract this half is language-agnostic: a Python or
- * TypeScript sweeper already compensates waits registered by Java, and vice
- * versa, because all three read the same ZSETs.
+ * <p>Per the cross-SDK contract the sweep is language-agnostic: all three SDKs
+ * read and write the same ZSETs, so a Python or TypeScript sweeper compensates
+ * waits registered by Java and vice versa.
  */
 public class WaitSweeper {
 

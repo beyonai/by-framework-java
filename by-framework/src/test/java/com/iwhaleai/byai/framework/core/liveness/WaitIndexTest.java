@@ -115,4 +115,37 @@ class WaitIndexTest {
         assertThrows(IllegalArgumentException.class,
                 () -> WaitIndex.decodeMember("a|b|c|d|e"));
     }
+
+    // --- key names (contract section 1) -------------------------------------
+
+    @Test
+    void theFourWaitKeysMatchThePythonSpellingExactly() {
+        // These are literal strings produced by the Python implementation. All
+        // three SDKs read and write the same keys, so a divergence here does not
+        // fail loudly — each side simply operates on keys the others never touch,
+        // and cross-language chains stop seeing each other with no error at all.
+        //
+        // This test exists because that is exactly what happened: Java originally
+        // spelled these with underscores (wait_index:0) while Python and TS use
+        // colons (wait:index:0). The member codec had reference-value tests; the
+        // key names did not, so nothing caught it.
+        assertEquals("byai_gateway:wait:index:0", Constants.RegistryKeys.waitIndex(0));
+        assertEquals("byai_gateway:wait:sweep_lock:3", Constants.RegistryKeys.waitSweepLock(3));
+        assertEquals("byai_gateway:wait:consumed:sess-1:abc123",
+                Constants.RegistryKeys.waitConsumed("sess-1", "abc123"));
+        assertEquals("byai_gateway:wait:renew_origin:sess-1:abc123",
+                Constants.RegistryKeys.waitRenewOrigin("sess-1", "abc123"));
+    }
+
+    @Test
+    void theShardKeysAreDeliberatelyUntagged() {
+        // Contract section 1: sharding exists to spread load, so the shard keys
+        // carry no Cluster hash tag and land in different slots — which is also
+        // why a sweep cannot do multi-key atomic work across them and must claim
+        // each shard independently.
+        assertFalse(Constants.RegistryKeys.waitIndex(0).contains("{"),
+                "the shard index must stay untagged");
+        assertFalse(Constants.RegistryKeys.waitSweepLock(0).contains("{"),
+                "the shard lock must stay untagged");
+    }
 }
