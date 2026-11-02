@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-11-02
+
 ### Added
 - Groundwork for bounding a suspended caller. A caller that dispatches with
   `waitForReply` ends its execution and is revived by a `ResumeCommand`, so
@@ -16,8 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A suspended caller is persisted as `WAITING_AGENT` / `WAITING_USER` rather
   than whatever the handler returned while unwinding. Visible on the execution
   record and in the dashboard; `QUEUED` now means only "not yet picked up".
-
-### Added
 - A background sweep over the wait index, started with the worker. Its two
   halves are independent switches: **pruning is on by default**
   (`BY_FRAMEWORK_WAIT_PRUNE_ENABLED`) because nothing else ever removes a
@@ -71,6 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its caller receives the metadata it dispatched with (replacing the waking
   hop's). **Handlers that treated the resumed header's metadata as "only what
   this hop just sent" will now see additional keys.**
+
+## [0.2.8] - 2026-05-18
 
 ### Added
 - GitHub PULL_REQUEST_TEMPLATE and ISSUE_TEMPLATEs.
